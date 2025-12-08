@@ -24,7 +24,7 @@ use async_lock::Mutex;
 use futures_util::StreamExt;
 use zbus::{
     Connection, Error as ZbusError,
-    zvariant::{Array, Error as ZvariantError, OwnedObjectPath, OwnedValue, Structure, Value},
+    zvariant::{Array, OwnedObjectPath, OwnedValue, Structure, Value},
 };
 
 use crate::{
@@ -488,17 +488,5 @@ impl ScreencastBackend {
         }
 
         streams
-    }
-}
-
-pub trait ZvariantErrorExt<T> {
-    fn downcast_failed(self) -> Result<T, PortalError>;
-}
-
-impl<T> ZvariantErrorExt<T> for Result<T, ZvariantError> {
-    fn downcast_failed(self) -> Result<T, PortalError> {
-        self.map_err(|e| {
-            PortalError::InvalidArgument(format!("failed to downcast argument: {}", e))
-        })
     }
 }

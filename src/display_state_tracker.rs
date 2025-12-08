@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Error as AnyError};
 use zbus::Connection;
 
-use crate::dbus::{ZvariantErrorExt, org_gnome_mutter_displayconfig::DisplayConfigProxy};
+use crate::dbus::org_gnome_mutter_displayconfig::DisplayConfigProxy;
 
 #[derive(Clone)]
 pub struct Monitor {
@@ -59,14 +59,13 @@ impl DisplayStateTracker {
         for ((connector, vendor, product, serial), modes, props) in monitors_data {
             let display_name = if let Some(v) = props.get("display-name") {
                 v.downcast_ref::<&str>()
-                    .downcast_failed()
                     .context("display-name")?
                     .to_string()
             } else {
                 connector.to_string()
             };
             let builtin = if let Some(v) = props.get("is-builtin") {
-                v.downcast_ref().downcast_failed().context("is-builtin")?
+                v.downcast_ref().context("is-builtin")?
             } else {
                 false
             };
