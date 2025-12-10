@@ -401,8 +401,18 @@ impl ScreencastBackend {
         iter: impl Iterator<Item = &'a Value<'a>>,
     ) -> Vec<ScreencastStream> {
         let mut streams = Vec::new();
-        let mut introspect_windows = None;
-        let mut display_refreshed = false;
+        let mut display_state = self.display_state_tracker.lock().await;
+        let windows = self
+            .shell_introspect_proxy
+            .get_windows()
+            .await
+            .unwrap_or_default();
+
+        if display_state.has_changed().await {
+            if let Err(e) = display_state.refresh().await {
+                tracing::warn!("failed to refresh display state: {}", e);
+            }
+        }
 
         for stream in iter {
             let Ok((id, source_type, data)) =
@@ -416,13 +426,6 @@ impl ScreencastBackend {
                     let Ok(match_string) = data.downcast_ref() else {
                         continue;
                     };
-                    let mut display_state = self.display_state_tracker.lock().await;
-                    if !display_refreshed {
-                        if let Err(e) = display_state.refresh().await {
-                            tracing::warn!("failed to refresh display state: {}", e);
-                        }
-                        display_refreshed = true;
-                    }
 
                     if let Some(monitor) = display_state.find_monitor(match_string) {
                         streams.push(ScreencastStream::Monitor {
@@ -438,20 +441,7 @@ impl ScreencastBackend {
                     let Ok((app_id, title)): Result<(String, String), _> = s.try_into() else {
                         continue;
                     };
-                    let windows = if let Some(w) = introspect_windows.as_ref() {
-                        w
-                    } else {
-                        match self.shell_introspect_proxy.get_windows().await {
-                            Ok(w) => {
-                                introspect_windows = Some(w);
-                                introspect_windows.as_ref().unwrap()
-                            }
-                            Err(e) => {
-                                tracing::warn!("failed to get windows: {}", e);
-                                &HashMap::new()
-                            }
-                        }
-                    };
+
                     for (wid, window) in windows.iter() {
                         let Some(v) = window.get("app-id") else {
                             continue;

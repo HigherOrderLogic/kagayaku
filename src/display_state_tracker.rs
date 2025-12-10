@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Error as AnyError};
+use futures_util::StreamExt;
 use zbus::Connection;
 
-use crate::dbus::org_gnome_mutter_displayconfig::DisplayConfigProxy;
+use crate::dbus::org_gnome_mutter_displayconfig::{DisplayConfigProxy, MonitorsChangedStream};
 
 #[derive(Clone)]
 pub struct Monitor {
@@ -33,14 +34,17 @@ impl Monitor {
 
 pub struct DisplayStateTracker {
     proxy: DisplayConfigProxy<'static>,
+    changed_stream: MonitorsChangedStream,
     monitors: HashMap<String, Monitor>,
 }
 
 impl DisplayStateTracker {
     pub async fn new(conn: &Connection) -> Result<Self, AnyError> {
         let proxy = DisplayConfigProxy::new(conn).await?;
+        let changed_stream = proxy.receive_monitors_changed().await?;
         let mut tracker = Self {
             proxy,
+            changed_stream,
             monitors: HashMap::new(),
         };
         tracker
@@ -93,6 +97,20 @@ impl DisplayStateTracker {
         }
 
         Ok(())
+    }
+
+    pub async fn has_changed(&mut self) -> bool {
+        if self.changed_stream.next().await.is_none() {
+            return false;
+        }
+
+        loop {
+            if self.changed_stream.next().await.is_none() {
+                break;
+            }
+        }
+
+        true
     }
 
     pub fn find_monitor(&self, match_string: &str) -> Option<&Monitor> {
