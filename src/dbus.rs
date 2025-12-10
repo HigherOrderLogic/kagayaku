@@ -271,7 +271,11 @@ impl ScreencastImpl for ScreencastBackend {
             session.persist_mode = p;
         }
         if let Some(s) = options.types() {
-            session.source_type = s;
+            session.source_type = if s.is_empty() {
+                SourceType::Monitor.into()
+            } else {
+                s
+            };
         }
 
         if session.persist_mode != PersistMode::DoNot
