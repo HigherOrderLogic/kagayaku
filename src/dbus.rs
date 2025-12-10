@@ -228,7 +228,7 @@ impl SessionImpl for ScreencastBackend {
 #[async_trait::async_trait]
 impl ScreencastImpl for ScreencastBackend {
     fn available_source_types(&self) -> BitFlags<SourceType> {
-        SourceType::Monitor | SourceType::Window | SourceType::Virtual
+        SourceType::Monitor | SourceType::Window
     }
 
     fn available_cursor_mode(&self) -> BitFlags<CursorMode> {
