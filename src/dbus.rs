@@ -32,7 +32,7 @@ use crate::{
     dbus::{
         org_gnome_mutter_screencast::ScreenCastProxy,
         org_gnome_mutter_screencast_session::SessionProxy,
-        org_gnome_mutter_screencast_stream::StreamProxy,
+        org_gnome_mutter_screencast_stream::{PipeWireStreamAddedStream, StreamProxy},
         org_gnome_shell_introspect::IntrospectProxy,
     },
     display_state_tracker::DisplayStateTracker,
@@ -43,9 +43,9 @@ const RESTORE_DATA_VERSION: u32 = 1;
 
 struct GnomeStream {
     id: u32,
-    proxy: StreamProxy<'static>,
     pipewire_node_id: Option<u32>,
     source_type: SourceType,
+    added_stream: PipeWireStreamAddedStream,
 }
 
 pub struct GnomeSession {
@@ -73,9 +73,7 @@ impl GnomeSession {
         self.proxy.start().await?;
 
         for stream in self.streams.iter_mut() {
-            // FIXME: wait for https://github.com/z-galaxy/zbus/pull/1389
-            let mut signals = stream.proxy.receive_pipe_wire_stream_added().await?;
-            if let Some(a) = signals.next().await
+            if let Some(a) = stream.added_stream.next().await
                 && let Ok(args) = a.args()
             {
                 stream.pipewire_node_id = Some(args.node_id);
@@ -138,12 +136,13 @@ impl GnomeSession {
             .path(object_path)?
             .build()
             .await?;
+        let added_stream = proxy.receive_pipe_wire_stream_added().await?;
 
         self.streams.push(GnomeStream {
             id,
-            proxy,
             pipewire_node_id: None,
             source_type,
+            added_stream,
         });
 
         Ok(())
