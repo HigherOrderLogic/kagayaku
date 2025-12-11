@@ -220,7 +220,7 @@ struct ScreencastSession {
     source_type: BitFlags<SourceType>,
     persist_mode: PersistMode,
     gnome_session: Option<GnomeSession>,
-    streams: Vec<ScreencastStream>,
+    restore_data: Option<OwnedValue>,
 }
 
 impl Default for ScreencastSession {
@@ -231,7 +231,7 @@ impl Default for ScreencastSession {
             source_type: SourceType::Monitor.into(),
             persist_mode: PersistMode::DoNot,
             gnome_session: None,
-            streams: Vec::new(),
+            restore_data: None,
         }
     }
 }
@@ -340,12 +340,8 @@ impl ScreencastImpl for ScreencastBackend {
             && let Some((provider, version, data)) = options.restore_data()
             && provider == RESTORE_DATA_PROVIDER
             && version == RESTORE_DATA_VERSION
-            && let Ok((_, _, a)) = data.to_owned().downcast::<(i64, i64, Array)>()
         {
-            let s = self.restore_streams(a.iter()).await;
-            if !s.is_empty() {
-                session.streams = s;
-            }
+            session.restore_data = Some(data.try_to_owned().unwrap());
         }
 
         Ok(SelectSourcesResponse {})
@@ -368,12 +364,28 @@ impl ScreencastImpl for ScreencastBackend {
             .create_session(HashMap::new())
             .await?;
         let mut gnome_session = GnomeSession::new(&self.connection, session_path).await?;
-        let prompt_session = session.streams.is_empty();
+
         let source_type = session.source_type;
+        let restored_streams = if session.persist_mode != PersistMode::DoNot
+            && let Some(d) = session.restore_data.as_ref()
+        {
+            // TODO: refactor when https://github.com/z-galaxy/zbus/pull/1604 land
+            if let Ok(s) = d.downcast_ref::<Structure>()
+                && let [_, _, Value::Array(a)] = s.fields()
+            {
+                self.restore_streams(a.iter()).await
+            } else {
+                tracing::debug!("unknown restore data");
+                None
+            }
+        } else {
+            None
+        };
+
         // drop while running the UI
         drop(sessions);
 
-        let prompted_streams = if prompt_session {
+        let prompted_streams = if restored_streams.is_none() {
             let (tx, rx) = unbounded();
             if let Err(e) = self
                 .ui_tx
@@ -401,8 +413,13 @@ impl ScreencastImpl for ScreencastBackend {
 
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(&session_token).unwrap();
+        let streams_iter = if let Some(s) = restored_streams.as_ref() {
+            s.iter()
+        } else {
+            prompted_streams.iter()
+        };
 
-        for stream in session.streams.iter().chain(prompted_streams.iter()) {
+        for stream in streams_iter {
             match stream {
                 ScreencastStream::Monitor {
                     id,
@@ -495,7 +512,7 @@ impl ScreencastBackend {
     async fn restore_streams<'a>(
         &'a self,
         iter: impl Iterator<Item = &'a Value<'a>>,
-    ) -> Vec<ScreencastStream> {
+    ) -> Option<Vec<ScreencastStream>> {
         let mut streams = Vec::new();
         let mut display_state = self.display_state_tracker.lock().await;
         let mut window_state = self.window_state_tracker.lock().await;
@@ -567,6 +584,10 @@ impl ScreencastBackend {
             }
         }
 
-        streams
+        if streams.is_empty() {
+            None
+        } else {
+            Some(streams)
+        }
     }
 }
