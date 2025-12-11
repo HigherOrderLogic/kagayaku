@@ -11,13 +11,13 @@ use ashpd::{
         request::RequestImpl,
         screencast::{
             CreateSessionOptions, ScreencastImpl, SelectSourcesOptions, SelectSourcesResponse,
-            StartCastOptions,
+            StartCastOptions, StartCastResponse, StartCastResponseBuilder,
         },
         session::{CreateSessionResponse, SessionImpl},
     },
     desktop::{
         HandleToken, PersistMode,
-        screencast::{CursorMode, SourceType, StreamBuilder, Streams, StreamsBuilder},
+        screencast::{CursorMode, SourceType, StreamBuilder},
     },
     enumflags2::BitFlags,
 };
@@ -27,7 +27,7 @@ use futures_util::StreamExt;
 use zbus::{
     Connection, Error as ZbusError,
     fdo::RequestNameFlags,
-    zvariant::{Array, OwnedObjectPath, OwnedValue, Structure, Value},
+    zvariant::{Array, OwnedObjectPath, OwnedValue, Signature, Structure, Value},
 };
 
 use crate::{
@@ -68,11 +68,17 @@ pub async fn backend_main(tx: Sender<PopupData>) -> Result<(), AnyError> {
     pending().await
 }
 
+pub enum GnomeStreamRestoreData {
+    Monitor { match_string: String },
+    Window { app_id: String, title: String },
+}
+
 struct GnomeStream {
     id: u32,
     pipewire_node_id: Option<u32>,
     source_type: SourceType,
     added_stream: PipeWireStreamAddedStream,
+    restore_data: GnomeStreamRestoreData,
 }
 
 pub struct GnomeSession {
@@ -119,6 +125,7 @@ impl GnomeSession {
         connection: &Connection,
         id: u32,
         connector: String,
+        match_string: String,
         cursor_mode: CursorMode,
     ) -> Result<(), ZbusError> {
         let mut props = HashMap::new();
@@ -126,8 +133,14 @@ impl GnomeSession {
         props.insert("cursor-mode", &cursor_mode_value);
 
         let object_path = self.proxy.record_monitor(&connector, props).await?;
-        self.new_stream(connection, id, SourceType::Monitor, object_path)
-            .await?;
+        self.new_stream(
+            connection,
+            id,
+            SourceType::Monitor,
+            object_path,
+            GnomeStreamRestoreData::Monitor { match_string },
+        )
+        .await?;
 
         Ok(())
     }
@@ -137,6 +150,8 @@ impl GnomeSession {
         connection: &Connection,
         id: u32,
         window_id: u64,
+        app_id: String,
+        title: String,
         cursor_mode: CursorMode,
     ) -> Result<(), ZbusError> {
         let mut props = HashMap::new();
@@ -146,8 +161,14 @@ impl GnomeSession {
         props.insert("cursor-mode", &cursor_mode_value);
 
         let object_path = self.proxy.record_window(props).await?;
-        self.new_stream(connection, id, SourceType::Window, object_path)
-            .await?;
+        self.new_stream(
+            connection,
+            id,
+            SourceType::Window,
+            object_path,
+            GnomeStreamRestoreData::Window { app_id, title },
+        )
+        .await?;
 
         Ok(())
     }
@@ -158,6 +179,7 @@ impl GnomeSession {
         id: u32,
         source_type: SourceType,
         object_path: OwnedObjectPath,
+        restore_data: GnomeStreamRestoreData,
     ) -> Result<(), ZbusError> {
         let proxy = StreamProxy::builder(connection)
             .path(object_path)?
@@ -170,6 +192,7 @@ impl GnomeSession {
             pipewire_node_id: None,
             source_type,
             added_stream,
+            restore_data,
         });
 
         Ok(())
@@ -178,8 +201,17 @@ impl GnomeSession {
 
 #[derive(Clone)]
 pub enum ScreencastStream {
-    Monitor { id: u32, connector: String },
-    Window { id: u32, window_id: u64 },
+    Monitor {
+        id: u32,
+        connector: String,
+        match_string: String,
+    },
+    Window {
+        id: u32,
+        window_id: u64,
+        app_id: String,
+        title: String,
+    },
 }
 
 struct ScreencastSession {
@@ -325,7 +357,7 @@ impl ScreencastImpl for ScreencastBackend {
         _: Option<AppID>,
         _: Option<WindowIdentifierType>,
         _: StartCastOptions,
-    ) -> Result<Streams, PortalError> {
+    ) -> Result<StartCastResponse, PortalError> {
         let sessions = self.sessions.lock().await;
         let Some(session) = sessions.get(&session_token) else {
             return Err(PortalError::InvalidArgument("unknown session token".into()));
@@ -372,22 +404,39 @@ impl ScreencastImpl for ScreencastBackend {
 
         for stream in session.streams.iter().chain(prompted_streams.iter()) {
             match stream {
-                ScreencastStream::Monitor { id, connector } => {
+                ScreencastStream::Monitor {
+                    id,
+                    connector,
+                    match_string,
+                } => {
                     if session.source_type.contains(SourceType::Monitor) {
                         gnome_session
                             .record_monitor(
                                 &self.connection,
                                 *id,
                                 connector.to_string(),
+                                match_string.to_string(),
                                 session.cursor_mode,
                             )
                             .await?;
                     }
                 }
-                ScreencastStream::Window { id, window_id } => {
+                ScreencastStream::Window {
+                    id,
+                    window_id,
+                    app_id,
+                    title,
+                } => {
                     if session.source_type.contains(SourceType::Window) {
                         gnome_session
-                            .record_window(&self.connection, *id, *window_id, session.cursor_mode)
+                            .record_window(
+                                &self.connection,
+                                *id,
+                                *window_id,
+                                app_id.to_string(),
+                                title.to_string(),
+                                session.cursor_mode,
+                            )
                             .await?;
                     }
                 }
@@ -397,6 +446,7 @@ impl ScreencastImpl for ScreencastBackend {
         gnome_session.start().await?;
 
         let mut streams = Vec::new();
+        let mut restore_data = Array::new(&Signature::try_from("uuv").unwrap());
 
         for stream in gnome_session.streams.iter() {
             if let Some(node_id) = stream.pipewire_node_id {
@@ -406,22 +456,38 @@ impl ScreencastImpl for ScreencastBackend {
                         .source_type(stream.source_type)
                         .build(),
                 );
+
+                if session.persist_mode != PersistMode::DoNot {
+                    let stream_data = match &stream.restore_data {
+                        GnomeStreamRestoreData::Monitor { match_string } => {
+                            Value::from(match_string.to_string())
+                        }
+                        GnomeStreamRestoreData::Window { app_id, title } => {
+                            Value::from((app_id.to_string(), title.to_string()))
+                        }
+                    };
+
+                    restore_data
+                        .append((stream.id, stream.source_type as u32, stream_data).into())
+                        .unwrap();
+                }
             }
         }
 
-        let restore_data = if session.persist_mode == PersistMode::DoNot {
-            None
-        } else {
-            // FIXME: ashpd
-            todo!()
-        };
+        let mut resp = StartCastResponseBuilder::new(streams);
+
+        if session.persist_mode != PersistMode::DoNot {
+            resp = resp.restore_data(Some((
+                RESTORE_DATA_PROVIDER.to_string(),
+                RESTORE_DATA_VERSION,
+                // we currently dont use timestamp
+                Value::from((0, 0, restore_data)).try_into_owned().unwrap(),
+            )));
+        }
 
         session.gnome_session = Some(gnome_session);
 
-        // FIXME: asphd issue
-        Ok(StreamsBuilder::new(streams)
-            .restore_token(restore_data)
-            .build())
+        Ok(resp.build())
     }
 }
 
@@ -462,6 +528,7 @@ impl ScreencastBackend {
                         streams.push(ScreencastStream::Monitor {
                             id,
                             connector: monitor.connector(),
+                            match_string: monitor.match_string(),
                         });
                     };
                 }
@@ -483,6 +550,8 @@ impl ScreencastBackend {
                             streams.push(ScreencastStream::Window {
                                 id: id,
                                 window_id: *wid,
+                                app_id,
+                                title,
                             });
                             break;
                         }
