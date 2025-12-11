@@ -61,7 +61,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 [[package]]
 name = "ashpd"
 version = "0.13.0"
-source = "git+https://github.com/bilelmoussaoui/ashpd.git#7f5fb5ae73b298b3d3e62d0ca71623dbceb88073"
+source = "git+https://github.com/higherorderlogic/ashpd.git#aa4e484ef112d08aad0e4b95d40aa02b54345c1a"
 dependencies = [
  "async-fs",
  "async-net",
