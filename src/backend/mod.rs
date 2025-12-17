@@ -1,5 +1,5 @@
-mod display_tracker;
-mod window_tracker;
+pub mod display_tracker;
+pub mod window_tracker;
 
 use std::{collections::HashMap, future::pending, sync::Arc};
 
@@ -40,7 +40,7 @@ use crate::{
         },
         window_tracker::WindowStateTracker,
     },
-    common::PopupData,
+    common::{PopupData, ToBackendMessage},
 };
 
 mod generated {
@@ -322,7 +322,7 @@ impl ScreencastImpl for ScreencastBackend {
     async fn start_cast(
         &self,
         session_token: HandleToken,
-        _: Option<AppID>,
+        client_app_id: Option<AppID>,
         _: Option<WindowIdentifierType>,
         _: StartCastOptions,
     ) -> Result<Streams, PortalError> {
@@ -338,24 +338,35 @@ impl ScreencastImpl for ScreencastBackend {
         let mut gnome_session = GnomeSession::new(&self.connection, session_path).await?;
         let prompt_session = session.streams.is_empty();
         let source_type = session.source_type;
+        let multiple = session.multiple;
         // drop while running the UI
         drop(sessions);
 
         let prompted_streams = if prompt_session {
             let (tx, rx) = unbounded();
-            if let Err(e) = self
-                .ui_tx
-                .send(PopupData {
-                    dbus_tx: tx,
-                    source_type,
-                })
-                .await
-            {
+            let display_state = self.display_state_tracker.lock().await;
+            let window_state = self.window_state_tracker.lock().await;
+            let popup_data = PopupData {
+                session_token: session_token.to_string(),
+                app_id: client_app_id.map(|i| i.to_string()),
+                backend_tx: tx,
+                multiple,
+                source_type,
+                monitors: display_state.monitors().clone(),
+                windows: window_state.windows().clone(),
+            };
+            if let Err(e) = self.ui_tx.send(popup_data).await {
                 tracing::warn!("failed to send UI message: {}", e);
+                tracing::warn!("the channel is probably closed");
                 return Err(PortalError::Failed(format!("cannot start UI: {}", e)));
             }
             match rx.recv().await {
-                Ok(s) => s,
+                Ok(s) => match s {
+                    ToBackendMessage::Success(s) => s,
+                    ToBackendMessage::Cancel => {
+                        return Err(PortalError::Failed("user cancelled".into()));
+                    }
+                },
                 Err(e) => {
                     return Err(PortalError::Failed(format!(
                         "failed to receive data from UI: {}",
@@ -461,7 +472,7 @@ impl ScreencastBackend {
                     if let Some(monitor) = display_state.find_monitor(match_string) {
                         streams.push(ScreencastStream::Monitor {
                             id,
-                            connector: monitor.connector(),
+                            connector: monitor.connector.to_string(),
                         });
                     };
                 }
@@ -481,7 +492,7 @@ impl ScreencastBackend {
                         // TODO: levenshtein distance search
                         if title == window.title {
                             streams.push(ScreencastStream::Window {
-                                id: id,
+                                id,
                                 window_id: *wid,
                             });
                             break;
