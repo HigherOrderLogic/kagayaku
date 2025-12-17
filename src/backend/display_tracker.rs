@@ -8,14 +8,13 @@ use super::generated::org_gnome_mutter_displayconfig::{DisplayConfigProxy, Monit
 
 #[derive(Clone)]
 pub struct Monitor {
-    connector: String,
-    vendor: String,
-    product: String,
-    serial: String,
-    display_name: String,
-    builtin: bool,
-    width: i32,
-    height: i32,
+    pub connector: String,
+    pub vendor: String,
+    pub product: String,
+    pub serial: String,
+    pub display_name: Option<String>,
+    pub builtin: bool,
+    pub size: Option<(i32, i32)>,
 }
 
 impl Monitor {
@@ -25,10 +24,6 @@ impl Monitor {
         } else {
             format!("{}:{}:{}", self.vendor, self.product, self.serial)
         }
-    }
-
-    pub fn connector(&self) -> String {
-        self.connector.to_string()
     }
 }
 
@@ -61,25 +56,20 @@ impl DisplayStateTracker {
         let (_, monitors_data, _, _) = self.proxy.get_current_state().await?;
 
         for ((connector, vendor, product, serial), modes, props) in monitors_data {
-            let display_name = if let Some(v) = props.get("display-name") {
-                v.downcast_ref::<&str>()
-                    .context("display-name")?
-                    .to_string()
-            } else {
-                connector.to_string()
-            };
-            let builtin = if let Some(v) = props.get("is-builtin") {
-                v.downcast_ref().context("is-builtin")?
-            } else {
-                false
-            };
-            let (width, height) = modes
+            let display_name = props
+                .get("display-name")
+                .and_then(|v| v.downcast_ref::<&str>().ok())
+                .map(|s| s.to_string());
+            let builtin = props
+                .get("is-builtin")
+                .is_some_and(|v| v.downcast_ref().unwrap_or(false));
+            let size = modes
                 .iter()
                 .find(|(_, _, _, _, _, _, p)| {
                     p.get("is-current")
-                        .map_or(false, |v| v.downcast_ref().unwrap_or(false))
+                        .is_some_and(|v| v.downcast_ref().unwrap_or(false))
                 })
-                .map_or((0, 0), |(_, w, h, _, _, _, _)| (*w, *h));
+                .map(|(_, w, h, _, _, _, _)| (*w, *h));
 
             monitors.insert(
                 connector.to_string(),
@@ -90,8 +80,7 @@ impl DisplayStateTracker {
                     serial,
                     display_name,
                     builtin,
-                    width,
-                    height,
+                    size,
                 },
             );
         }
@@ -119,5 +108,9 @@ impl DisplayStateTracker {
         self.monitors
             .values()
             .find(|m| m.match_string() == match_string)
+    }
+
+    pub fn monitors(&self) -> &HashMap<String, Monitor> {
+        &self.monitors
     }
 }

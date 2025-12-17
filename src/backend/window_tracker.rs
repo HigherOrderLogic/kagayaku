@@ -8,6 +8,7 @@ use crate::backend::generated::org_gnome_shell_introspect::{
     IntrospectProxy, WindowsChangedStream,
 };
 
+#[derive(Clone)]
 pub struct Window {
     pub app_id: String,
     pub title: String,

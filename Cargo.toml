@@ -11,6 +11,7 @@ async-global-executor = "3.1.0"
 async-lock = "3.4.1"
 async-trait = "0.1.89"
 futures-util = "0.3.31"
+iced = { version = "0.14.0", default-features = false, features = ["wayland","thread-pool", "wgpu", "web-colors"] }
 tracing = "0.1.43"
 zbus = { version = "5.12.0", features = ["serde_bytes"] }
 

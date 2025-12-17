@@ -1,5 +1,5 @@
-mod display_tracker;
-mod window_tracker;
+pub mod display_tracker;
+pub mod window_tracker;
 
 use std::{collections::HashMap, future::pending, sync::Arc};
 
@@ -40,7 +40,7 @@ use crate::{
         },
         window_tracker::WindowStateTracker,
     },
-    common::PopupData,
+    common::{PopupData, ScreencastStreamChoice, ToBackendMessage},
 };
 
 mod generated {
@@ -243,6 +243,7 @@ pub struct ScreencastBackend {
     window_state_tracker: Arc<Mutex<WindowStateTracker>>,
     sessions: Arc<Mutex<HashMap<HandleToken, ScreencastSession>>>,
     mutter_screencast_proxy: ScreenCastProxy<'static>,
+    counter: u32,
 }
 
 impl ScreencastBackend {
@@ -260,6 +261,7 @@ impl ScreencastBackend {
             window_state_tracker,
             sessions,
             mutter_screencast_proxy,
+            counter: 0,
         })
     }
 }
@@ -350,7 +352,7 @@ impl ScreencastImpl for ScreencastBackend {
     async fn start_cast(
         &self,
         session_token: HandleToken,
-        _: Option<AppID>,
+        client_app_id: Option<AppID>,
         _: Option<WindowIdentifierType>,
         _: StartCastOptions,
     ) -> Result<StartCastResponse, PortalError> {
@@ -381,26 +383,69 @@ impl ScreencastImpl for ScreencastBackend {
         } else {
             None
         };
+        let multiple = session.multiple;
+        let persist_mode = session.persist_mode;
 
         // drop while running the UI
         drop(sessions);
 
-        let prompted_streams = if restored_streams.is_none() {
+        let (remember, prompted_streams) = if restored_streams.is_none() {
             let (tx, rx) = unbounded();
-            if let Err(e) = self
-                .ui_tx
-                .send(PopupData {
-                    dbus_tx: tx,
-                    source_type,
-                })
-                .await
-            {
+            let display_state = self.display_state_tracker.lock().await;
+            let window_state = self.window_state_tracker.lock().await;
+            let popup_data = PopupData {
+                session_token: session_token.to_string(),
+                app_id: client_app_id.map(|i| i.to_string()),
+                backend_tx: tx,
+                multiple,
+                source_type,
+                persist_mode,
+                monitors: display_state.monitors().clone(),
+                windows: window_state.windows().clone(),
+            };
+
+            drop(display_state);
+            drop(window_state);
+
+            if let Err(e) = self.ui_tx.send(popup_data).await {
                 tracing::warn!("failed to send UI message: {}", e);
                 return Err(PortalError::Failed(format!("cannot start UI: {}", e)));
             }
             match rx.recv().await {
-                Ok(s) => s,
+                Ok(s) => match s {
+                    ToBackendMessage::Success((b, v)) => {
+                        let mut res = Vec::new();
+                        for choice in v {
+                            let (id, _) = self.counter.overflowing_add(1);
+                            match choice {
+                                ScreencastStreamChoice::Monitor {
+                                    connector,
+                                    match_string,
+                                } => res.push(ScreencastStream::Monitor {
+                                    id,
+                                    connector,
+                                    match_string,
+                                }),
+                                ScreencastStreamChoice::Window {
+                                    window_id,
+                                    app_id,
+                                    title,
+                                } => res.push(ScreencastStream::Window {
+                                    id,
+                                    window_id,
+                                    app_id,
+                                    title,
+                                }),
+                            }
+                        }
+                        (b, res)
+                    }
+                    ToBackendMessage::Cancel => {
+                        return Err(PortalError::Failed("user cancelled".into()));
+                    }
+                },
                 Err(e) => {
+                    tracing::warn!("failed to receive data from UI: {}", e);
                     return Err(PortalError::Failed(format!(
                         "failed to receive data from UI: {}",
                         e
@@ -408,7 +453,7 @@ impl ScreencastImpl for ScreencastBackend {
                 }
             }
         } else {
-            Vec::new()
+            (false, Vec::new())
         };
 
         let mut sessions = self.sessions.lock().await;
@@ -474,7 +519,7 @@ impl ScreencastImpl for ScreencastBackend {
                         .build(),
                 );
 
-                if session.persist_mode != PersistMode::DoNot {
+                if remember && session.persist_mode != PersistMode::DoNot {
                     let stream_data = match &stream.restore_data {
                         GnomeStreamRestoreData::Monitor { match_string } => {
                             Value::from(match_string.to_string())
@@ -493,7 +538,7 @@ impl ScreencastImpl for ScreencastBackend {
 
         let mut resp = StartCastResponseBuilder::new(streams);
 
-        if session.persist_mode != PersistMode::DoNot {
+        if remember && session.persist_mode != PersistMode::DoNot {
             resp = resp.restore_data(Some((
                 RESTORE_DATA_PROVIDER.to_string(),
                 RESTORE_DATA_VERSION,
@@ -544,10 +589,10 @@ impl ScreencastBackend {
                     if let Some(monitor) = display_state.find_monitor(match_string) {
                         streams.push(ScreencastStream::Monitor {
                             id,
-                            connector: monitor.connector(),
+                            connector: monitor.connector.to_string(),
                             match_string: monitor.match_string(),
                         });
-                    };
+                    }
                 }
                 v if v == SourceType::Window as u32 => {
                     let Ok(s) = data.downcast_ref::<Structure>() else {
@@ -565,7 +610,7 @@ impl ScreencastBackend {
                         // TODO: levenshtein distance search
                         if title == window.title {
                             streams.push(ScreencastStream::Window {
-                                id: id,
+                                id,
                                 window_id: *wid,
                                 app_id,
                                 title,
