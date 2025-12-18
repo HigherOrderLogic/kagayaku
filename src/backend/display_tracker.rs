@@ -4,7 +4,7 @@ use anyhow::{Context, Error as AnyError};
 use futures_util::StreamExt;
 use zbus::Connection;
 
-use crate::dbus::org_gnome_mutter_displayconfig::{DisplayConfigProxy, MonitorsChangedStream};
+use super::generated::org_gnome_mutter_displayconfig::{DisplayConfigProxy, MonitorsChangedStream};
 
 #[derive(Clone)]
 pub struct Monitor {
@@ -56,7 +56,7 @@ impl DisplayStateTracker {
     }
 
     pub async fn refresh(&mut self) -> Result<(), AnyError> {
-        self.monitors.clear();
+        let mut monitors = HashMap::new();
 
         let (_, monitors_data, _, _) = self.proxy.get_current_state().await?;
 
@@ -81,7 +81,7 @@ impl DisplayStateTracker {
                 })
                 .map_or((0, 0), |(_, w, h, _, _, _, _)| (*w, *h));
 
-            self.monitors.insert(
+            monitors.insert(
                 connector.to_string(),
                 Monitor {
                     connector,
@@ -95,6 +95,8 @@ impl DisplayStateTracker {
                 },
             );
         }
+
+        self.monitors = monitors;
 
         Ok(())
     }

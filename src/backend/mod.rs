@@ -1,11 +1,13 @@
-include!(concat!(env!("OUT_DIR"), "/dbus.rs"));
+mod display_tracker;
+mod window_tracker;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::pending, sync::Arc};
 
-use anyhow::Error as AnyError;
+use anyhow::{Context, Error as AnyError};
 use ashpd::{
     AppID, PortalError, WindowIdentifierType,
     backend::{
+        Builder,
         request::RequestImpl,
         screencast::{
             CreateSessionOptions, ScreencastImpl, SelectSourcesOptions, SelectSourcesResponse,
@@ -24,22 +26,47 @@ use async_lock::Mutex;
 use futures_util::StreamExt;
 use zbus::{
     Connection, Error as ZbusError,
+    fdo::RequestNameFlags,
     zvariant::{Array, OwnedObjectPath, OwnedValue, Structure, Value},
 };
 
 use crate::{
-    common::PopupData,
-    dbus::{
-        org_gnome_mutter_screencast::ScreenCastProxy,
-        org_gnome_mutter_screencast_session::SessionProxy,
-        org_gnome_mutter_screencast_stream::{PipeWireStreamAddedStream, StreamProxy},
-        org_gnome_shell_introspect::IntrospectProxy,
+    backend::{
+        display_tracker::DisplayStateTracker,
+        generated::{
+            org_gnome_mutter_screencast::ScreenCastProxy,
+            org_gnome_mutter_screencast_session::SessionProxy,
+            org_gnome_mutter_screencast_stream::{PipeWireStreamAddedStream, StreamProxy},
+        },
+        window_tracker::WindowStateTracker,
     },
-    display_state_tracker::DisplayStateTracker,
+    common::PopupData,
 };
+
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/dbus.rs"));
+}
 
 const RESTORE_DATA_PROVIDER: &str = "Kagayaku";
 const RESTORE_DATA_VERSION: u32 = 1;
+
+pub async fn backend_main(tx: Sender<PopupData>) -> Result<(), AnyError> {
+    Builder::new("org.freedesktop.impl.portal.desktop.kagayaku")
+        .context("failed to create builder")?
+        .with_flags(
+            RequestNameFlags::AllowReplacement
+                | RequestNameFlags::DoNotQueue
+                | RequestNameFlags::ReplaceExisting,
+        )
+        .screencast(ScreencastBackend::new(tx).await?)
+        .build()
+        .await
+        .context("failed to build DBus backend")?;
+
+    tracing::debug!("starting loop");
+
+    pending().await
+}
 
 struct GnomeStream {
     id: u32,
@@ -181,26 +208,26 @@ pub struct ScreencastBackend {
     ui_tx: Sender<PopupData>,
     connection: Connection,
     display_state_tracker: Arc<Mutex<DisplayStateTracker>>,
+    window_state_tracker: Arc<Mutex<WindowStateTracker>>,
     sessions: Arc<Mutex<HashMap<HandleToken, ScreencastSession>>>,
     mutter_screencast_proxy: ScreenCastProxy<'static>,
-    shell_introspect_proxy: IntrospectProxy<'static>,
 }
 
 impl ScreencastBackend {
     pub async fn new(ui_tx: Sender<PopupData>) -> Result<Self, AnyError> {
         let connection = Connection::session().await?;
         let display_state_tracker = Mutex::new(DisplayStateTracker::new(&connection).await?).into();
+        let window_state_tracker = Mutex::new(WindowStateTracker::new(&connection).await?).into();
         let sessions = Mutex::new(HashMap::new()).into();
         let mutter_screencast_proxy = ScreenCastProxy::new(&connection).await?;
-        let shell_introspect_proxy = IntrospectProxy::new(&connection).await?;
 
         Ok(Self {
             ui_tx,
             connection,
             display_state_tracker,
+            window_state_tracker,
             sessions,
             mutter_screencast_proxy,
-            shell_introspect_proxy,
         })
     }
 }
@@ -405,15 +432,16 @@ impl ScreencastBackend {
     ) -> Vec<ScreencastStream> {
         let mut streams = Vec::new();
         let mut display_state = self.display_state_tracker.lock().await;
-        let windows = self
-            .shell_introspect_proxy
-            .get_windows()
-            .await
-            .unwrap_or_default();
+        let mut window_state = self.window_state_tracker.lock().await;
 
         if display_state.has_changed().await {
             if let Err(e) = display_state.refresh().await {
                 tracing::warn!("failed to refresh display state: {}", e);
+            }
+        }
+        if window_state.has_changed().await {
+            if let Err(e) = window_state.refresh().await {
+                tracing::warn!("failed to refresh window state: {}", e);
             }
         }
 
@@ -445,24 +473,13 @@ impl ScreencastBackend {
                         continue;
                     };
 
-                    for (wid, window) in windows.iter() {
-                        let Some(v) = window.get("app-id") else {
-                            continue;
-                        };
-                        let Ok(app_id_str) = v.downcast_ref::<&str>() else {
-                            continue;
-                        };
-                        if app_id != app_id_str {
+                    for (wid, window) in window_state.windows().iter() {
+                        if window.app_id != app_id {
                             continue;
                         }
 
-                        let Some(v) = window.get("title") else {
-                            continue;
-                        };
                         // TODO: levenshtein distance search
-                        if let Ok(s) = v.downcast_ref::<&str>()
-                            && title == s
-                        {
+                        if title == window.title {
                             streams.push(ScreencastStream::Window {
                                 id: id,
                                 window_id: *wid,
@@ -474,7 +491,8 @@ impl ScreencastBackend {
                 v if v == SourceType::Virtual as u32 => {
                     continue;
                 }
-                _ => {
+                v => {
+                    tracing::debug!("unknown source type: {}", v);
                     continue;
                 }
             }
