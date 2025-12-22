@@ -1,0 +1,11 @@
+[Unit]
+Description=Portal service (Kagayaku implementation)
+After=graphical-session.target
+Requisite=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.kagayaku
+ExecStart=@libexecdir@/kagayaku
+Restart=on-failure

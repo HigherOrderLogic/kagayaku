@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.kagayaku
+Interfaces=org.freedesktop.impl.portal.ScreenCast
+UseIn=niri

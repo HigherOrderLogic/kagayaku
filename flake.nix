@@ -17,6 +17,10 @@
         '';
       });
 
+    packages = forEachSystem (system: pkgs: {
+      default = pkgs.callPackage ./package.nix {};
+    });
+
     devShells = forEachSystem (system: pkgs: {
       default = pkgs.mkShell {
         packages = with pkgs; [rustc cargo clippy rustfmt];

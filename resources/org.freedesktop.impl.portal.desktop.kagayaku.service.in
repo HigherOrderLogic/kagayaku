@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.kagayaku
+Exec=@libexecdir@/kagayaku
+SystemdService=xdg-desktop-portal-kagayaku.service
