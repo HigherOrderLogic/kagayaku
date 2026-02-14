@@ -369,10 +369,7 @@ impl ScreencastImpl for ScreencastBackend {
         let restored_streams = if session.persist_mode != PersistMode::DoNot
             && let Some(d) = session.restore_data.as_ref()
         {
-            // TODO: refactor when https://github.com/z-galaxy/zbus/pull/1604 land
-            if let Ok(s) = d.downcast_ref::<Structure>()
-                && let [_, _, Value::Array(a)] = s.fields()
-            {
+            if let Ok((_, _, a)) = d.downcast_ref::<(i64, i64, Array)>() {
                 self.restore_streams(a.iter()).await
             } else {
                 tracing::debug!("unknown restore data");
