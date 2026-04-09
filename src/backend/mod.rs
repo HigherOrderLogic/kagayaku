@@ -16,15 +16,12 @@ use ashpd::{
   backend::{
     Builder,
     request::RequestImpl,
-    screencast::{
-      CreateSessionOptions, ScreencastImpl, SelectSourcesOptions, SelectSourcesResponse, StartCastOptions,
-      StartCastResponse, StartCastResponseBuilder,
-    },
+    screencast::{ScreencastImpl, SelectSourcesResponse},
     session::{CreateSessionResponse, SessionImpl},
   },
   desktop::{
-    HandleToken, PersistMode,
-    screencast::{CursorMode, SourceType, StreamBuilder},
+    CreateSessionOptions, HandleToken, PersistMode,
+    screencast::{CursorMode, SelectSourcesOptions, SourceType, StartCastOptions, StreamBuilder, Streams, StreamsBuilder},
   },
   enumflags2::BitFlags,
 };
@@ -371,7 +368,7 @@ impl ScreencastImpl for ScreencastBackend {
     if let Some(p) = options.persist_mode() {
       session.persist_mode = p;
     }
-    if let Some(s) = options.types() {
+    if let Some(s) = options.sources() {
       session.source_type = if s.is_empty() { SourceType::Monitor.into() } else { s };
     }
 
@@ -396,7 +393,7 @@ impl ScreencastImpl for ScreencastBackend {
     client_app_id: Option<AppID>,
     window_identifier: Option<WindowIdentifierType>,
     _: StartCastOptions,
-  ) -> Result<StartCastResponse, PortalError> {
+  ) -> Result<Streams, PortalError> {
     tracing::info!("starting screencast session");
     if let Some(window_identifier) = window_identifier {
       tracing::debug!(
@@ -588,7 +585,7 @@ impl ScreencastImpl for ScreencastBackend {
       }
     }
 
-    let mut resp = StartCastResponseBuilder::new(streams);
+    let mut resp = StreamsBuilder::new(streams);
 
     if remember && session.persist_mode != PersistMode::DoNot {
       resp = resp.restore_data(Some((
