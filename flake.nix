@@ -1,9 +1,17 @@
 {
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = {nixpkgs, ...}: let
+  outputs = {
+    nixpkgs,
+    rust-overlay,
+    ...
+  }: let
     inherit (nixpkgs) lib;
 
     forEachSystem = fn: lib.genAttrs lib.systems.flakeExposed (system: fn system nixpkgs.legacyPackages.${system});
@@ -11,9 +19,13 @@
     formatter = forEachSystem (system: pkgs:
       pkgs.writeShellApplication {
         name = "aljd";
-        runtimeInputs = with pkgs; [alejandra fd];
+        runtimeInputs = builtins.attrValues {
+          inherit (pkgs) alejandra fd cargo;
+          inherit (rust-overlay.packages.${system}.rust-nightly.availableComponents) rustfmt;
+        };
         text = ''
           fd "$@" -t f -e nix -X alejandra -q '{}'
+          cargo fmt --all
         '';
       });
 
@@ -23,7 +35,10 @@
 
     devShells = forEachSystem (system: pkgs: {
       default = pkgs.mkShell {
-        packages = with pkgs; [rustc cargo clippy rustfmt];
+        packages = builtins.attrValues {
+          inherit (pkgs) rustc cargo clippy;
+          inherit (rust-overlay.packages.${system}.rust-nightly.availableComponents) rustfmt;
+        };
       };
     });
   };
