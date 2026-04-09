@@ -2,6 +2,9 @@
   lib,
   stdenv,
   rustPlatform,
+  libxkbcommon,
+  libGL,
+  wayland,
 }:
 rustPlatform.buildRustPackage (finalAttrs: let
   cargoToml = lib.importTOML "${finalAttrs.src}/Cargo.toml";
@@ -26,6 +29,15 @@ in {
   };
 
   dontCargoInstall = true;
+
+  buildInputs = [libxkbcommon libGL wayland];
+
+  env.RUSTFLAGS = lib.concatMapStringsSep " " (s: "-C link-arg=${s}") [
+    "-Wl,-rpath,${lib.makeLibraryPath [libxkbcommon libGL wayland]},--no-as-needed"
+    "-lwayland-client"
+    "-lxkbcommon"
+    "-lGL"
+  ];
 
   makeFlags = [
     "prefix=${placeholder "out"}"

@@ -1,14 +1,18 @@
 mod backend;
 mod common;
+mod ui;
 
-use std::{io::stderr, thread::available_parallelism};
+use std::{
+    io::stderr,
+    thread::{Builder as ThreadBuilder, available_parallelism},
+};
 
 use anyhow::{Context, Error as AnyError};
 use async_channel::unbounded;
 use async_global_executor::{GlobalExecutorConfig, block_on, init_with_config};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::backend::backend_main;
+use crate::{backend::backend_main, ui::ui_main};
 
 fn main() -> Result<(), AnyError> {
     Registry::default()
@@ -25,5 +29,15 @@ fn main() -> Result<(), AnyError> {
     );
 
     let (tx, rx) = unbounded();
-    block_on(backend_main(tx)).context("main function returns error")
+
+    ThreadBuilder::new()
+        .name("backend".into())
+        .spawn(move || {
+            if let Err(e) = block_on(backend_main(tx)) {
+                tracing::error!("main function returns error: {}", e);
+            }
+        })
+        .context("failed to spawn backend thread")?;
+
+    ui_main(rx).context("ui event loop returns error")
 }

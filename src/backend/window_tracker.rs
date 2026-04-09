@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Error as AnyError};
-use futures_util::StreamExt;
 use zbus::Connection;
 
-use crate::backend::generated::org_gnome_shell_introspect::{
-    IntrospectProxy, WindowsChangedStream,
-};
+use crate::backend::generated::org_gnome_shell_introspect::IntrospectProxy;
 
+#[derive(Clone)]
 pub struct Window {
     pub app_id: String,
     pub title: String,
@@ -15,17 +13,14 @@ pub struct Window {
 
 pub struct WindowStateTracker {
     proxy: IntrospectProxy<'static>,
-    changed_stream: WindowsChangedStream,
     windows: HashMap<u64, Window>,
 }
 
 impl WindowStateTracker {
     pub async fn new(conn: &Connection) -> Result<Self, AnyError> {
         let proxy = IntrospectProxy::new(conn).await?;
-        let changed_stream = proxy.receive_windows_changed().await?;
         let mut tracker = Self {
             proxy,
-            changed_stream,
             windows: HashMap::new(),
         };
         tracker
@@ -60,20 +55,6 @@ impl WindowStateTracker {
         self.windows = windows;
 
         Ok(())
-    }
-
-    pub async fn has_changed(&mut self) -> bool {
-        if self.changed_stream.next().await.is_none() {
-            return false;
-        }
-
-        loop {
-            if self.changed_stream.next().await.is_none() {
-                break;
-            }
-        }
-
-        true
     }
 
     pub fn windows(&self) -> &HashMap<u64, Window> {

@@ -1,7 +1,14 @@
-mod display_tracker;
-mod window_tracker;
+pub mod display_tracker;
+pub mod window_tracker;
 
-use std::{collections::HashMap, future::pending, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::pending,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use anyhow::{Context, Error as AnyError};
 use ashpd::{
@@ -23,7 +30,11 @@ use ashpd::{
 };
 use async_channel::{Sender, unbounded};
 use async_lock::Mutex;
-use futures_util::StreamExt;
+use futures_util::{
+    StreamExt,
+    task::{FutureObj, Spawn, SpawnError},
+};
+use tracing::instrument;
 use zbus::{
     Connection, Error as ZbusError,
     fdo::RequestNameFlags,
@@ -40,7 +51,7 @@ use crate::{
         },
         window_tracker::WindowStateTracker,
     },
-    common::PopupData,
+    common::{PopupData, ScreencastStreamChoice, ToBackendMessage},
 };
 
 mod generated {
@@ -50,6 +61,15 @@ mod generated {
 const RESTORE_DATA_PROVIDER: &str = "Kagayaku";
 const RESTORE_DATA_VERSION: u32 = 1;
 
+struct GlobalExecutorSpawner;
+
+impl Spawn for GlobalExecutorSpawner {
+    fn spawn_obj(&self, future: FutureObj<'static, ()>) -> Result<(), SpawnError> {
+        async_global_executor::spawn(future).detach();
+        Ok(())
+    }
+}
+
 pub async fn backend_main(tx: Sender<PopupData>) -> Result<(), AnyError> {
     Builder::new("org.freedesktop.impl.portal.desktop.kagayaku")
         .context("failed to create builder")?
@@ -58,12 +78,13 @@ pub async fn backend_main(tx: Sender<PopupData>) -> Result<(), AnyError> {
                 | RequestNameFlags::DoNotQueue
                 | RequestNameFlags::ReplaceExisting,
         )
+        .with_spawn(GlobalExecutorSpawner)
         .screencast(ScreencastBackend::new(tx).await?)
         .build()
         .await
         .context("failed to build DBus backend")?;
 
-    tracing::debug!("starting loop");
+    tracing::info!("starting backend loop");
 
     pending().await
 }
@@ -77,6 +98,9 @@ struct GnomeStream {
     id: u32,
     pipewire_node_id: Option<u32>,
     source_type: SourceType,
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+    mapping_id: Option<String>,
     added_stream: PipeWireStreamAddedStream,
     restore_data: GnomeStreamRestoreData,
 }
@@ -91,10 +115,7 @@ impl GnomeSession {
         connection: &Connection,
         object_path: OwnedObjectPath,
     ) -> Result<Self, ZbusError> {
-        let proxy = SessionProxy::builder(connection)
-            .path(object_path)?
-            .build()
-            .await?;
+        let proxy = SessionProxy::new(connection, object_path).await?;
 
         Ok(Self {
             proxy,
@@ -181,16 +202,40 @@ impl GnomeSession {
         object_path: OwnedObjectPath,
         restore_data: GnomeStreamRestoreData,
     ) -> Result<(), ZbusError> {
-        let proxy = StreamProxy::builder(connection)
-            .path(object_path)?
-            .build()
-            .await?;
+        let proxy = StreamProxy::new(connection, object_path).await?;
         let added_stream = proxy.receive_pipe_wire_stream_added().await?;
+        let (position, size, mapping_id) = match proxy.parameters().await {
+            Ok(parameters) => {
+                let position = parameters
+                    .get("position")
+                    .and_then(|v| v.downcast_ref::<(i32, i32)>().ok());
+                let size = parameters
+                    .get("size")
+                    .and_then(|v| v.downcast_ref::<(i32, i32)>().ok());
+                let mapping_id = parameters
+                    .get("mapping-id")
+                    .and_then(|v| v.downcast_ref::<&str>().ok())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        parameters
+                            .get("mapping-id")
+                            .and_then(|v| v.downcast_ref::<String>().ok())
+                    });
+                (position, size, mapping_id)
+            }
+            Err(e) => {
+                tracing::warn!("failed to fetch stream parameters: {}", e);
+                (None, None, None)
+            }
+        };
 
         self.streams.push(GnomeStream {
             id,
             pipewire_node_id: None,
             source_type,
+            position,
+            size,
+            mapping_id,
             added_stream,
             restore_data,
         });
@@ -243,6 +288,7 @@ pub struct ScreencastBackend {
     window_state_tracker: Arc<Mutex<WindowStateTracker>>,
     sessions: Arc<Mutex<HashMap<HandleToken, ScreencastSession>>>,
     mutter_screencast_proxy: ScreenCastProxy<'static>,
+    counter: AtomicU32,
 }
 
 impl ScreencastBackend {
@@ -260,13 +306,17 @@ impl ScreencastBackend {
             window_state_tracker,
             sessions,
             mutter_screencast_proxy,
+            counter: AtomicU32::new(0),
         })
     }
 }
 
 #[async_trait::async_trait]
 impl RequestImpl for ScreencastBackend {
-    async fn close(&self, _: HandleToken) {}
+    #[instrument(skip_all, fields(token = %_token))]
+    async fn close(&self, _token: HandleToken) {
+        tracing::info!("closing request");
+    }
 }
 
 #[async_trait::async_trait]
@@ -290,21 +340,21 @@ impl ScreencastImpl for ScreencastBackend {
     }
 
     fn available_cursor_mode(&self) -> BitFlags<CursorMode> {
-        CursorMode::Hidden | CursorMode::Embedded | CursorMode::Metadata
+        // FIXME: ashpd 0.13.0-alpha cant deserialize metadata cursor mode (value 4)
+        CursorMode::Hidden | CursorMode::Embedded
     }
 
     async fn create_session(
         &self,
-        token: HandleToken,
+        _: HandleToken,
         session_token: HandleToken,
         _: Option<AppID>,
         _: CreateSessionOptions,
     ) -> Result<CreateSessionResponse, PortalError> {
         let mut sessions = self.sessions.lock().await;
+        sessions.insert(session_token.clone(), Default::default());
 
-        sessions.insert(session_token, Default::default());
-
-        Ok(CreateSessionResponse::new(token))
+        Ok(CreateSessionResponse::new(session_token))
     }
 
     // TODO: support remote desktop session
@@ -347,13 +397,25 @@ impl ScreencastImpl for ScreencastBackend {
         Ok(SelectSourcesResponse {})
     }
 
+    #[instrument(
+        skip(self, window_identifier),
+        fields(session_token = %session_token, app_id = ?client_app_id)
+    )]
     async fn start_cast(
         &self,
         session_token: HandleToken,
-        _: Option<AppID>,
-        _: Option<WindowIdentifierType>,
+        client_app_id: Option<AppID>,
+        window_identifier: Option<WindowIdentifierType>,
         _: StartCastOptions,
     ) -> Result<StartCastResponse, PortalError> {
+        tracing::info!("starting screencast session");
+        if let Some(window_identifier) = window_identifier {
+            tracing::debug!(
+                "received parent window identifier `{}`, but setting transient parent for the Iced UI is currently unsupported",
+                window_identifier
+            );
+        }
+
         let sessions = self.sessions.lock().await;
         let Some(session) = sessions.get(&session_token) else {
             return Err(PortalError::InvalidArgument("unknown session token".into()));
@@ -378,26 +440,85 @@ impl ScreencastImpl for ScreencastBackend {
         } else {
             None
         };
+        let multiple = session.multiple;
+        let persist_mode = session.persist_mode;
 
         // drop while running the UI
         drop(sessions);
 
-        let prompted_streams = if restored_streams.is_none() {
+        let (remember, prompted_streams) = if restored_streams.is_none() {
             let (tx, rx) = unbounded();
-            if let Err(e) = self
-                .ui_tx
-                .send(PopupData {
-                    dbus_tx: tx,
-                    source_type,
-                })
-                .await
-            {
+            let (monitors, windows) = {
+                let mut display_state = self.display_state_tracker.lock().await;
+                let mut window_state = self.window_state_tracker.lock().await;
+
+                if let Err(e) = display_state.refresh().await {
+                    tracing::warn!("failed to refresh display state: {}", e);
+                }
+                if let Err(e) = window_state.refresh().await {
+                    tracing::warn!("failed to refresh window state: {}", e);
+                }
+
+                (
+                    display_state.monitors().clone(),
+                    window_state.windows().clone(),
+                )
+            };
+
+            let popup_data = PopupData {
+                session_token: session_token.to_string(),
+                app_id: client_app_id.map(|i| i.to_string()),
+                backend_tx: tx,
+                multiple,
+                source_type,
+                persist_mode,
+                monitors,
+                windows,
+            };
+
+            if let Err(e) = self.ui_tx.send(popup_data).await {
                 tracing::warn!("failed to send UI message: {}", e);
                 return Err(PortalError::Failed(format!("cannot start UI: {}", e)));
             }
-            match rx.recv().await {
-                Ok(s) => s,
+            let backend_msg = rx.recv().await;
+
+            match backend_msg {
+                Ok(s) => match s {
+                    ToBackendMessage::Success((b, v)) => {
+                        tracing::info!(selected_sources = v.len(), "ui accepted screencast");
+                        let mut res = Vec::new();
+                        for choice in v {
+                            let id = self.counter.fetch_add(1, Ordering::Relaxed);
+                            match choice {
+                                ScreencastStreamChoice::Monitor {
+                                    connector,
+                                    match_string,
+                                } => res.push(ScreencastStream::Monitor {
+                                    id,
+                                    connector,
+                                    match_string,
+                                }),
+                                ScreencastStreamChoice::Window {
+                                    window_id,
+                                    app_id,
+                                    title,
+                                } => res.push(ScreencastStream::Window {
+                                    id,
+                                    window_id,
+                                    app_id,
+                                    title,
+                                }),
+                            }
+                        }
+                        (b, res)
+                    }
+                    ToBackendMessage::Cancel => {
+                        tracing::info!("ui cancelled screencast");
+                        return Err(PortalError::Cancelled("user cancelled".into()));
+                    }
+                },
                 Err(e) => {
+                    tracing::warn!("failed to receive data from UI: {}", e);
                     return Err(PortalError::Failed(format!(
                         "failed to receive data from UI: {}",
                         e
@@ -405,7 +526,7 @@ impl ScreencastImpl for ScreencastBackend {
                 }
             }
         } else {
-            Vec::new()
+            (false, Vec::new())
         };
 
         let mut sessions = self.sessions.lock().await;
@@ -464,14 +585,17 @@ impl ScreencastImpl for ScreencastBackend {
 
         for stream in gnome_session.streams.iter() {
             if let Some(node_id) = stream.pipewire_node_id {
-                streams.push(
-                    StreamBuilder::new(node_id)
-                        .id(Some(stream.id.to_string()))
-                        .source_type(stream.source_type)
-                        .build(),
-                );
+                let mut stream_builder = StreamBuilder::new(node_id)
+                    .id(Some(stream.id.to_string()))
+                    .source_type(stream.source_type);
 
-                if session.persist_mode != PersistMode::DoNot {
+                stream_builder = stream_builder.position(stream.position);
+                stream_builder = stream_builder.size(stream.size);
+                stream_builder = stream_builder.mapping_id(stream.mapping_id.clone());
+
+                streams.push(stream_builder.build());
+
+                if remember && session.persist_mode != PersistMode::DoNot {
                     let stream_data = match &stream.restore_data {
                         GnomeStreamRestoreData::Monitor { match_string } => {
                             Value::from(match_string.to_string())
@@ -490,7 +614,7 @@ impl ScreencastImpl for ScreencastBackend {
 
         let mut resp = StartCastResponseBuilder::new(streams);
 
-        if session.persist_mode != PersistMode::DoNot {
+        if remember && session.persist_mode != PersistMode::DoNot {
             resp = resp.restore_data(Some((
                 RESTORE_DATA_PROVIDER.to_string(),
                 RESTORE_DATA_VERSION,
@@ -514,15 +638,11 @@ impl ScreencastBackend {
         let mut display_state = self.display_state_tracker.lock().await;
         let mut window_state = self.window_state_tracker.lock().await;
 
-        if display_state.has_changed().await {
-            if let Err(e) = display_state.refresh().await {
-                tracing::warn!("failed to refresh display state: {}", e);
-            }
+        if let Err(e) = display_state.refresh().await {
+            tracing::warn!("failed to refresh display state: {}", e);
         }
-        if window_state.has_changed().await {
-            if let Err(e) = window_state.refresh().await {
-                tracing::warn!("failed to refresh window state: {}", e);
-            }
+        if let Err(e) = window_state.refresh().await {
+            tracing::warn!("failed to refresh window state: {}", e);
         }
 
         for stream in iter {
@@ -541,10 +661,10 @@ impl ScreencastBackend {
                     if let Some(monitor) = display_state.find_monitor(match_string) {
                         streams.push(ScreencastStream::Monitor {
                             id,
-                            connector: monitor.connector(),
+                            connector: monitor.connector.to_string(),
                             match_string: monitor.match_string(),
                         });
-                    };
+                    }
                 }
                 v if v == SourceType::Window as u32 => {
                     let Ok(s) = data.downcast_ref::<Structure>() else {
@@ -562,7 +682,7 @@ impl ScreencastBackend {
                         // TODO: levenshtein distance search
                         if title == window.title {
                             streams.push(ScreencastStream::Window {
-                                id: id,
+                                id,
                                 window_id: *wid,
                                 app_id,
                                 title,
