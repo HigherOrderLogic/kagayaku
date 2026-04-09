@@ -17,5 +17,6 @@ zbus = { version = "5.13.2", features = ["serde_bytes"] }
 
 [build-dependencies]
 anyhow = "1.0.101"
+regex = "1.12.3"
 zbus_xml = "5.1.0"
 zbus_xmlgen = "5.2.0"
