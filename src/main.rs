@@ -1,15 +1,24 @@
 mod backend;
 mod common;
 
-use std::thread::available_parallelism;
+use std::{io::stderr, thread::available_parallelism};
 
 use anyhow::{Context, Error as AnyError};
 use async_channel::unbounded;
 use async_global_executor::{GlobalExecutorConfig, block_on, init_with_config};
+use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::backend::backend_main;
 
 fn main() -> Result<(), AnyError> {
+    Registry::default()
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(format!("{}=debug", env!("CARGO_BIN_NAME")))),
+        )
+        .with(fmt::layer().with_writer(stderr))
+        .init();
+
     init_with_config(
         GlobalExecutorConfig::default()
             .with_max_threads(available_parallelism().map_or(1, |n| n.get())),
