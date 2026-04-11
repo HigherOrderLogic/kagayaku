@@ -21,7 +21,9 @@ use ashpd::{
   },
   desktop::{
     CreateSessionOptions, HandleToken, PersistMode,
-    screencast::{CursorMode, SelectSourcesOptions, SourceType, StartCastOptions, StreamBuilder, Streams, StreamsBuilder},
+    screencast::{
+      CursorMode, SelectSourcesOptions, SourceType, StartCastOptions, StreamBuilder, Streams, StreamsBuilder,
+    },
   },
   enumflags2::BitFlags,
 };
@@ -384,7 +386,7 @@ impl ScreencastImpl for ScreencastBackend {
   }
 
   #[instrument(
-        skip(self, window_identifier),
+        skip(self),
         fields(session_token = %session_token, app_id = ?client_app_id)
     )]
   async fn start_cast(
@@ -395,12 +397,6 @@ impl ScreencastImpl for ScreencastBackend {
     _: StartCastOptions,
   ) -> Result<Streams, PortalError> {
     tracing::info!("starting screencast session");
-    if let Some(window_identifier) = window_identifier {
-      tracing::debug!(
-        "received parent window identifier `{}`, but setting transient parent for the Iced UI is currently unsupported",
-        window_identifier
-      );
-    }
 
     let sessions = self.sessions.lock().await;
     let Some(session) = sessions.get(&session_token) else {
@@ -448,6 +444,13 @@ impl ScreencastImpl for ScreencastBackend {
       let popup_data = PopupData {
         session_token: session_token.to_string(),
         app_id: client_app_id.map(|i| i.to_string()),
+        parent_window: window_identifier.and_then(|ty| {
+          if let WindowIdentifierType::Wayland(id) = ty {
+            Some(id)
+          } else {
+            None
+          }
+        }),
         backend_tx: tx,
         multiple,
         source_type,

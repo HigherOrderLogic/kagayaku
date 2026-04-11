@@ -29,6 +29,7 @@ pub enum ToBackendMessage {
 pub struct PopupData {
   pub session_token: String,
   pub app_id: Option<String>,
+  pub parent_window: Option<String>,
   pub backend_tx: Sender<ToBackendMessage>,
   pub multiple: bool,
   pub source_type: BitFlags<SourceType>,

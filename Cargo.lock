@@ -1503,6 +1503,7 @@ dependencies = [
  "futures-util",
  "iced",
  "regex",
+ "smithay-client-toolkit 0.20.0",
  "tracing",
  "tracing-subscriber",
  "zbus",

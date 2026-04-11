@@ -1,3 +1,5 @@
+mod wayland;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use ashpd::{
@@ -8,14 +10,25 @@ use async_channel::{Receiver, Sender};
 use iced::{
   Alignment, Element, Font, Length, Settings, Size, Subscription, Task, daemon, exit,
   font::Weight,
+  wgpu::rwh::{RawDisplayHandle, RawWindowHandle},
   widget::{self, button, checkbox, column, container, grid, rich_text, row, scrollable, space, span, text},
   window::{self, Level, close_requests},
+};
+use sctk::reexports::{
+  client::{
+    Connection, Proxy,
+    backend::{Backend, ObjectId},
+    globals::registry_queue_init,
+    protocol::wl_surface::WlSurface,
+  },
+  protocols::xdg::foreign::zv2::client::zxdg_importer_v2::ZxdgImporterV2,
 };
 use tracing::instrument;
 
 use crate::{
   backend::{display_tracker::Monitor, window_tracker::Window},
   common::{PopupData, ScreencastStreamChoice, ToBackendMessage},
+  ui::wayland::WaylandState,
 };
 
 #[derive(Clone, Copy)]
@@ -34,13 +47,14 @@ enum ChoiceType {
 #[derive(Clone)]
 enum Message {
   PopupReceived(Option<PopupData>),
-  PopupWindowOpened(window::Id),
   PopupCloseRequested(window::Id),
   ToggleChoice(ChoiceType, bool),
   ToggleInclude(IncludeType, bool),
   ToggleRemember(bool),
   Cancel,
   Share,
+  WaylandReady(Connection, WlSurface, String),
+  None,
 }
 
 struct State {
@@ -94,6 +108,7 @@ impl Daemon {
     let PopupData {
       session_token,
       app_id,
+      parent_window,
       backend_tx,
       multiple,
       source_type,
@@ -124,7 +139,33 @@ impl Daemon {
       window_id,
     });
 
-    open_task.map(Message::PopupWindowOpened)
+    open_task.then(move |id| {
+      if let Some(parent) = parent_window.clone() {
+        window::run(id, |w| {
+          let Ok(RawWindowHandle::Wayland(window_handle)) = w.window_handle().map(|h| h.as_raw()) else {
+            return Message::None;
+          };
+          let Ok(RawDisplayHandle::Wayland(display_handle)) = w.display_handle().map(|h| h.as_raw()) else {
+            return Message::None;
+          };
+          let backend = unsafe { Backend::from_foreign_display(display_handle.display.as_ptr().cast()) };
+          let conn = Connection::from_backend(backend);
+          let surface_id =
+            match unsafe { ObjectId::from_ptr(WlSurface::interface(), window_handle.surface.as_ptr().cast()) } {
+              Ok(sid) => sid,
+              Err(_) => return Message::None,
+            };
+          let Ok(surface) = WlSurface::from_id(&conn, surface_id) else {
+            tracing::warn!("invalid wl_surface id");
+            return Message::None;
+          };
+          Message::WaylandReady(conn, surface, parent)
+        })
+      } else {
+        tracing::info!("no parent window to associate");
+        Task::none()
+      }
+    })
   }
 
   fn close_active_with(&mut self, backend_message: ToBackendMessage) -> Task<Message> {
@@ -162,7 +203,6 @@ impl Daemon {
         tracing::info!("ui request channel closed; exiting ui loop");
         exit()
       }
-      Message::PopupWindowOpened(_window_id) => Task::none(),
       Message::PopupCloseRequested(window_id) => {
         let Some(active_popup) = self.active_popup.as_ref() else {
           return Task::none();
@@ -259,10 +299,28 @@ impl Daemon {
 
         self.close_active_with(ToBackendMessage::Success((active_popup.state.remember_choice, choices)))
       }
+      Message::WaylandReady(conn, surface, parent) => {
+        let Ok((globals, event_queue)) = registry_queue_init::<WaylandState>(&conn) else {
+          tracing::warn!("failed to init registry queue");
+          return Task::none();
+        };
+        let qh = event_queue.handle();
+        if let Ok(importer) = globals.bind::<ZxdgImporterV2, _, _>(&qh, 1..=1, ()) {
+          importer.import_toplevel(parent, &qh, ()).set_parent_of(&surface);
+          if let Err(e) = event_queue.flush() {
+            tracing::warn!("failed to send Wayland request to compositor: {}", e);
+          }
+        } else {
+          tracing::warn!("failed to bind {}", ZxdgImporterV2::interface().name);
+        }
+
+        Task::none()
+      }
+      Message::None => Task::none(),
     }
   }
 
-  fn view(&self, _window_id: window::Id) -> Element<'_, Message> {
+  fn view(&self, _: window::Id) -> Element<'_, Message> {
     let Some(active_popup) = self.active_popup.as_ref() else {
       return text("Waiting for screencast request...").into();
     };
