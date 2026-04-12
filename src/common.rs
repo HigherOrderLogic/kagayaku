@@ -25,6 +25,11 @@ pub enum ToBackendMessage {
   Cancel,
 }
 
+pub enum ToUiMessage {
+  NewPopup(PopupData),
+  CloseSession(String),
+}
+
 #[derive(Clone)]
 pub struct PopupData {
   pub session_token: String,

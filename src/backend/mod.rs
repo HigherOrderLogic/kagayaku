@@ -50,7 +50,7 @@ use crate::{
     },
     window_tracker::WindowStateTracker,
   },
-  common::{PopupData, ScreencastStreamChoice, ToBackendMessage},
+  common::{PopupData, ScreencastStreamChoice, ToBackendMessage, ToUiMessage},
 };
 
 mod generated {
@@ -69,7 +69,7 @@ impl Spawn for GlobalExecutorSpawner {
   }
 }
 
-pub async fn backend_main(tx: Sender<PopupData>) -> Result<(), AnyError> {
+pub async fn backend_main(tx: Sender<ToUiMessage>) -> Result<(), AnyError> {
   Builder::new("org.freedesktop.impl.portal.desktop.kagayaku")
     .context("failed to create builder")?
     .with_flags(RequestNameFlags::AllowReplacement | RequestNameFlags::DoNotQueue | RequestNameFlags::ReplaceExisting)
@@ -274,7 +274,7 @@ impl Default for ScreencastSession {
 }
 
 pub struct ScreencastBackend {
-  ui_tx: Sender<PopupData>,
+  ui_tx: Sender<ToUiMessage>,
   connection: Connection,
   display_state_tracker: Arc<Mutex<DisplayStateTracker>>,
   window_state_tracker: Arc<Mutex<WindowStateTracker>>,
@@ -284,7 +284,7 @@ pub struct ScreencastBackend {
 }
 
 impl ScreencastBackend {
-  pub async fn new(ui_tx: Sender<PopupData>) -> Result<Self, AnyError> {
+  pub async fn new(ui_tx: Sender<ToUiMessage>) -> Result<Self, AnyError> {
     let connection = Connection::session().await?;
     let display_state_tracker = Mutex::new(DisplayStateTracker::new(&connection).await?).into();
     let window_state_tracker = Mutex::new(WindowStateTracker::new(&connection).await?).into();
@@ -313,12 +313,21 @@ impl RequestImpl for ScreencastBackend {
 
 #[async_trait::async_trait]
 impl SessionImpl for ScreencastBackend {
+  #[instrument(skip(self))]
   async fn session_closed(&self, session_token: HandleToken) -> Result<(), PortalError> {
     let mut sessions = self.sessions.lock().await;
-    if let Some(session) = sessions.remove(&session_token)
-      && let Some(gnome_session) = &session.gnome_session
-    {
-      gnome_session.stop().await?;
+    if let Some(session) = sessions.remove(&session_token) {
+      tracing::info!("closing session");
+      drop(sessions);
+      if let Err(e) = self
+        .ui_tx
+        .try_send(ToUiMessage::CloseSession(session_token.to_string()))
+      {
+        tracing::warn!("failed to send close request to UI thread: {}", e);
+      }
+      if let Some(gnome_session) = session.gnome_session {
+        gnome_session.stop().await?
+      }
     }
 
     Ok(())
@@ -385,10 +394,7 @@ impl ScreencastImpl for ScreencastBackend {
     Ok(SelectSourcesResponse {})
   }
 
-  #[instrument(
-        skip(self),
-        fields(session_token = %session_token, app_id = ?client_app_id)
-    )]
+  #[instrument(skip(self), fields(app_id = ?client_app_id))]
   async fn start_cast(
     &self,
     session_token: HandleToken,
@@ -459,7 +465,7 @@ impl ScreencastImpl for ScreencastBackend {
         windows,
       };
 
-      if let Err(e) = self.ui_tx.send(popup_data).await {
+      if let Err(e) = self.ui_tx.send(ToUiMessage::NewPopup(popup_data)).await {
         tracing::warn!("failed to send UI message: {}", e);
         return Err(PortalError::Failed(format!("cannot start UI: {}", e)));
       }

@@ -1,15 +1,21 @@
 mod wayland;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+  any::TypeId,
+  collections::{HashMap, HashSet, VecDeque},
+  hash::{Hash, Hasher},
+};
 
 use ashpd::{
   desktop::{PersistMode, screencast::SourceType},
   enumflags2::BitFlags,
 };
 use async_channel::{Receiver, Sender};
+use futures_util::SinkExt;
 use iced::{
   Alignment, Element, Font, Length, Settings, Size, Subscription, Task, daemon, exit,
   font::Weight,
+  stream,
   wgpu::rwh::{RawDisplayHandle, RawWindowHandle},
   widget::{self, button, checkbox, column, container, grid, rich_text, row, scrollable, space, span, text},
   window::{self, Level, close_requests},
@@ -27,7 +33,7 @@ use tracing::instrument;
 
 use crate::{
   backend::{display_tracker::Monitor, window_tracker::Window},
-  common::{PopupData, ScreencastStreamChoice, ToBackendMessage},
+  common::{PopupData, ScreencastStreamChoice, ToBackendMessage, ToUiMessage},
   ui::wayland::WaylandState,
 };
 
@@ -48,6 +54,7 @@ enum ChoiceType {
 enum Message {
   PopupReceived(Option<PopupData>),
   PopupCloseRequested(window::Id),
+  PopupSessionClosed(String),
   ToggleChoice(ChoiceType, bool),
   ToggleInclude(IncludeType, bool),
   ToggleRemember(bool),
@@ -86,6 +93,7 @@ impl State {
 }
 
 struct ActivePopup {
+  session_token: String,
   app_id: Option<String>,
   backend_tx: Sender<ToBackendMessage>,
   multiple: bool,
@@ -95,13 +103,30 @@ struct ActivePopup {
   windows: HashMap<u64, Window>,
   state: State,
   window_id: window::Id,
+  parent_set: bool,
 }
 
 struct Daemon {
-  ui_rx: Receiver<PopupData>,
+  ui_rx: Receiver<ToUiMessage>,
   active_popup: Option<ActivePopup>,
   queued_popups: VecDeque<PopupData>,
 }
+
+struct UiSubscriptionState(Receiver<ToUiMessage>);
+
+impl Hash for UiSubscriptionState {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    TypeId::of::<Self>().hash(state);
+  }
+}
+
+impl PartialEq for UiSubscriptionState {
+  fn eq(&self, _: &Self) -> bool {
+    true
+  }
+}
+
+impl Eq for UiSubscriptionState {}
 
 impl Daemon {
   fn activate_popup(&mut self, popup_data: PopupData) -> Task<Message> {
@@ -128,6 +153,7 @@ impl Daemon {
     });
 
     self.active_popup = Some(ActivePopup {
+      session_token,
       app_id,
       backend_tx,
       multiple,
@@ -137,6 +163,7 @@ impl Daemon {
       windows,
       state: Default::default(),
       window_id,
+      parent_set: false,
     });
 
     open_task.then(move |id| {
@@ -174,17 +201,31 @@ impl Daemon {
       return Task::none();
     };
 
-    let _ = active_popup.backend_tx.send_blocking(backend_message);
+    if let Err(e) = active_popup.backend_tx.try_send(backend_message) {
+      tracing::warn!("failed to send message to backend: {}", e);
+    }
     let close_task = window::close(active_popup.window_id);
 
     if let Some(next_popup) = self.queued_popups.pop_front() {
       tracing::info!("opening queued popup request");
       Task::batch([close_task, self.activate_popup(next_popup)])
     } else {
-      Task::batch([close_task, {
-        let ui_rx = self.ui_rx.clone();
-        Task::perform(async move { ui_rx.recv().await.ok() }, Message::PopupReceived)
-      }])
+      let ui_rx = self.ui_rx.clone();
+      Task::batch([
+        close_task,
+        Task::perform(
+          async move {
+            loop {
+              match ui_rx.recv().await {
+                Ok(ToUiMessage::NewPopup(d)) => break Some(d),
+                Err(_) => break None,
+                _ => continue,
+              }
+            }
+          },
+          Message::PopupReceived,
+        ),
+      ])
     }
   }
 
@@ -212,6 +253,26 @@ impl Daemon {
         }
         tracing::info!("popup close requested, cancelling request");
         self.close_active_with(ToBackendMessage::Cancel)
+      }
+      Message::PopupSessionClosed(session_token) => {
+        if let Some(active_popup) = self.active_popup.as_ref()
+          && active_popup.session_token == session_token
+        {
+          if active_popup.parent_set {
+            tracing::info!(
+              "popup for session {} is associated with a parent, ignoring",
+              session_token
+            );
+            return Task::none();
+          } else {
+            tracing::info!("popup cancelled by backend for session {}", session_token);
+            return self.close_active_with(ToBackendMessage::Cancel);
+          }
+        } else {
+          self.queued_popups.retain(|p| p.session_token != session_token);
+        }
+
+        Task::none()
       }
       Message::ToggleChoice(choice_type, selected) => {
         let Some(active_popup) = self.active_popup.as_mut() else {
@@ -309,6 +370,8 @@ impl Daemon {
           importer.import_toplevel(parent, &qh, ()).set_parent_of(&surface);
           if let Err(e) = event_queue.flush() {
             tracing::warn!("failed to send Wayland request to compositor: {}", e);
+          } else if let Some(popup) = self.active_popup.as_mut() {
+            popup.parent_set = true;
           }
         } else {
           tracing::warn!("failed to bind {}", ZxdgImporterV2::interface().name);
@@ -460,9 +523,36 @@ impl Daemon {
     .padding(4)
     .into()
   }
+
+  fn subscription(&self) -> Subscription<Message> {
+    if self.active_popup.is_some() {
+      Subscription::batch([
+        close_requests().map(Message::PopupCloseRequested),
+        Subscription::run_with(UiSubscriptionState(self.ui_rx.clone()), |s| {
+          let ui_rx = s.0.clone();
+          stream::channel(1, async move |mut output| {
+            loop {
+              match ui_rx.recv().await {
+                Ok(ToUiMessage::CloseSession(t)) => {
+                  if let Err(e) = output.send(Message::PopupSessionClosed(t)).await {
+                    tracing::warn!("failed to send message to main event loop: {}", e)
+                  }
+                  break;
+                }
+                Err(_) => break,
+                _ => continue,
+              }
+            }
+          })
+        }),
+      ])
+    } else {
+      Subscription::none()
+    }
+  }
 }
 
-pub fn ui_main(ui_rx: Receiver<PopupData>) -> iced::Result {
+pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
   tracing::info!("starting UI loop");
   daemon(
     move || {
@@ -473,7 +563,18 @@ pub fn ui_main(ui_rx: Receiver<PopupData>) -> iced::Result {
           active_popup: None,
           queued_popups: VecDeque::new(),
         },
-        Task::perform(async move { ui_rx_clone.recv().await.ok() }, Message::PopupReceived),
+        Task::perform(
+          async move {
+            loop {
+              match ui_rx_clone.recv().await {
+                Ok(ToUiMessage::NewPopup(d)) => break Some(d),
+                Err(_) => break None,
+                _ => continue,
+              }
+            }
+          },
+          Message::PopupReceived,
+        ),
       )
     },
     Daemon::update,
@@ -492,12 +593,6 @@ pub fn ui_main(ui_rx: Receiver<PopupData>) -> iced::Result {
       "Kagayaku".into()
     }
   })
-  .subscription(|state| {
-    if state.active_popup.is_some() {
-      close_requests().map(Message::PopupCloseRequested)
-    } else {
-      Subscription::none()
-    }
-  })
+  .subscription(Daemon::subscription)
   .run()
 }
