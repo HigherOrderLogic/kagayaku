@@ -1,10 +1,6 @@
 mod wayland;
 
-use std::{
-  any::TypeId,
-  collections::{HashMap, HashSet, VecDeque},
-  hash::{Hash, Hasher},
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ashpd::{
   desktop::{PersistMode, screencast::SourceType},
@@ -61,6 +57,7 @@ enum Message {
   Cancel,
   Share,
   WaylandReady(Connection, WlSurface, String),
+  Exit,
   None,
 }
 
@@ -107,26 +104,9 @@ struct ActivePopup {
 }
 
 struct Daemon {
-  ui_rx: Receiver<ToUiMessage>,
   active_popup: Option<ActivePopup>,
   queued_popups: VecDeque<PopupData>,
 }
-
-struct UiSubscriptionState(Receiver<ToUiMessage>);
-
-impl Hash for UiSubscriptionState {
-  fn hash<H: Hasher>(&self, state: &mut H) {
-    TypeId::of::<Self>().hash(state);
-  }
-}
-
-impl PartialEq for UiSubscriptionState {
-  fn eq(&self, _: &Self) -> bool {
-    true
-  }
-}
-
-impl Eq for UiSubscriptionState {}
 
 impl Daemon {
   fn activate_popup(&mut self, popup_data: PopupData) -> Task<Message> {
@@ -210,22 +190,7 @@ impl Daemon {
       tracing::info!("opening queued popup request");
       Task::batch([close_task, self.activate_popup(next_popup)])
     } else {
-      let ui_rx = self.ui_rx.clone();
-      Task::batch([
-        close_task,
-        Task::perform(
-          async move {
-            loop {
-              match ui_rx.recv().await {
-                Ok(ToUiMessage::NewPopup(d)) => break Some(d),
-                Err(_) => break None,
-                _ => continue,
-              }
-            }
-          },
-          Message::PopupReceived,
-        ),
-      ])
+      close_task
     }
   }
 
@@ -379,6 +344,16 @@ impl Daemon {
 
         Task::none()
       }
+      Message::Exit => {
+        if let Some(active_popup) = self.active_popup.take() {
+          tracing::info!("closing active popup before exiting");
+          if let Err(e) = active_popup.backend_tx.try_send(ToBackendMessage::Cancel) {
+            tracing::warn!("failed to send message to backend: {}", e);
+          }
+        };
+
+        exit()
+      }
       Message::None => Task::none(),
     }
   }
@@ -526,26 +501,7 @@ impl Daemon {
 
   fn subscription(&self) -> Subscription<Message> {
     if self.active_popup.is_some() {
-      Subscription::batch([
-        close_requests().map(Message::PopupCloseRequested),
-        Subscription::run_with(UiSubscriptionState(self.ui_rx.clone()), |s| {
-          let ui_rx = s.0.clone();
-          stream::channel(1, async move |mut output| {
-            loop {
-              match ui_rx.recv().await {
-                Ok(ToUiMessage::CloseSession(t)) => {
-                  if let Err(e) = output.send(Message::PopupSessionClosed(t)).await {
-                    tracing::warn!("failed to send message to main event loop: {}", e)
-                  }
-                  break;
-                }
-                Err(_) => break,
-                _ => continue,
-              }
-            }
-          })
-        }),
-      ])
+      close_requests().map(Message::PopupCloseRequested)
     } else {
       Subscription::none()
     }
@@ -559,22 +515,27 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
       let ui_rx_clone = ui_rx.clone();
       (
         Daemon {
-          ui_rx: ui_rx.clone(),
           active_popup: None,
           queued_popups: VecDeque::new(),
         },
-        Task::perform(
-          async move {
-            loop {
-              match ui_rx_clone.recv().await {
-                Ok(ToUiMessage::NewPopup(d)) => break Some(d),
-                Err(_) => break None,
-                _ => continue,
+        Task::stream(stream::channel(10, async move |mut out| {
+          let mut stop = false;
+          while !stop {
+            match ui_rx_clone.recv().await {
+              Ok(ToUiMessage::NewPopup(d)) => {
+                out.send(Message::PopupReceived(Some(d))).await.unwrap();
+              }
+              Ok(ToUiMessage::CloseSession(t)) => {
+                out.send(Message::PopupSessionClosed(t)).await.unwrap();
+              }
+              Err(e) => {
+                tracing::info!("channel from backend closed: {}", e);
+                stop = true;
+                out.send(Message::Exit).await.unwrap();
               }
             }
-          },
-          Message::PopupReceived,
-        ),
+          }
+        })),
       )
     },
     Daemon::update,
