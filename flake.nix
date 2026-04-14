@@ -8,6 +8,7 @@
   };
 
   outputs = {
+    self,
     nixpkgs,
     rust-overlay,
     ...
@@ -35,6 +36,7 @@
 
     devShells = forEachSystem (system: pkgs: {
       default = pkgs.mkShell {
+        inputsFrom = builtins.attrValues self.packages.${system};
         packages = builtins.attrValues {
           inherit (pkgs) rustc cargo clippy;
           inherit (rust-overlay.packages.${system}.rust-nightly.availableComponents) rustfmt;
