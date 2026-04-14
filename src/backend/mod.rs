@@ -8,11 +8,12 @@ use std::{
     Arc,
     atomic::{AtomicU32, Ordering},
   },
+  time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Error as AnyError};
 use ashpd::{
-  AppID, PortalError, WindowIdentifierType,
+  MaybeAppID, PortalError, WindowIdentifierType,
   backend::{
     Builder,
     request::RequestImpl,
@@ -349,7 +350,7 @@ impl ScreencastImpl for ScreencastBackend {
     &self,
     _: HandleToken,
     session_token: HandleToken,
-    _: Option<AppID>,
+    _: Option<MaybeAppID>,
     _: CreateSessionOptions,
   ) -> Result<CreateSessionResponse, PortalError> {
     let mut sessions = self.sessions.lock().await;
@@ -362,7 +363,7 @@ impl ScreencastImpl for ScreencastBackend {
   async fn select_sources(
     &self,
     session_token: HandleToken,
-    _: Option<AppID>,
+    _: Option<MaybeAppID>,
     options: SelectSourcesOptions,
   ) -> Result<SelectSourcesResponse, PortalError> {
     let mut sessions = self.sessions.lock().await;
@@ -398,7 +399,7 @@ impl ScreencastImpl for ScreencastBackend {
   async fn start_cast(
     &self,
     session_token: HandleToken,
-    client_app_id: Option<AppID>,
+    client_app_id: Option<MaybeAppID>,
     window_identifier: Option<WindowIdentifierType>,
     _: StartCastOptions,
   ) -> Result<Streams, PortalError> {
@@ -417,7 +418,7 @@ impl ScreencastImpl for ScreencastBackend {
       && let Some(d) = session.restore_data.as_ref()
     {
       if let Ok((_, _, a)) = d.downcast_ref::<(i64, i64, Array)>() {
-        self.restore_streams(a.iter()).await
+        self.restore_streams(a.iter(), source_type).await
       } else {
         tracing::debug!("unknown restore data");
         None
@@ -522,6 +523,8 @@ impl ScreencastImpl for ScreencastBackend {
     } else {
       prompted_streams.iter()
     };
+    let should_return_restore_data =
+      session.persist_mode != PersistMode::DoNot && (restored_streams.is_some() || remember);
 
     for stream in streams_iter {
       match stream {
@@ -568,6 +571,14 @@ impl ScreencastImpl for ScreencastBackend {
 
     let mut streams = Vec::new();
     let mut restore_data = Array::new(&Signature::try_from("uuv").unwrap());
+    let last_used_time = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map_or(0, |d| d.as_micros().try_into().unwrap_or(i64::MAX));
+    let creation_time = session
+      .restore_data
+      .as_ref()
+      .and_then(|d| d.downcast_ref::<(i64, i64, Array)>().ok())
+      .map_or(last_used_time, |(t, _, _)| t);
 
     for stream in gnome_session.streams.iter() {
       if let Some(node_id) = stream.pipewire_node_id {
@@ -581,7 +592,7 @@ impl ScreencastImpl for ScreencastBackend {
 
         streams.push(stream_builder.build());
 
-        if remember && session.persist_mode != PersistMode::DoNot {
+        if should_return_restore_data {
           let stream_data = match &stream.restore_data {
             GnomeStreamRestoreData::Monitor { match_string } => Value::from(match_string.to_string()),
             GnomeStreamRestoreData::Window { app_id, title } => Value::from((app_id.to_string(), title.to_string())),
@@ -596,12 +607,13 @@ impl ScreencastImpl for ScreencastBackend {
 
     let mut resp = StreamsBuilder::new(streams);
 
-    if remember && session.persist_mode != PersistMode::DoNot {
-      resp = resp.restore_data(Some((
+    if should_return_restore_data {
+      resp = resp.persist_mode(Some(session.persist_mode)).restore_data(Some((
         RESTORE_DATA_PROVIDER.to_string(),
         RESTORE_DATA_VERSION,
-        // we currently dont use timestamp
-        Value::from((0, 0, restore_data)).try_into_owned().unwrap(),
+        Value::from((creation_time, last_used_time, restore_data))
+          .try_into_owned()
+          .unwrap(),
       )));
     }
 
@@ -612,7 +624,11 @@ impl ScreencastImpl for ScreencastBackend {
 }
 
 impl ScreencastBackend {
-  async fn restore_streams<'a>(&'a self, iter: impl Iterator<Item = &'a Value<'a>>) -> Option<Vec<ScreencastStream>> {
+  async fn restore_streams<'a>(
+    &'a self,
+    iter: impl Iterator<Item = &'a Value<'a>>,
+    source_types: BitFlags<SourceType>,
+  ) -> Option<Vec<ScreencastStream>> {
     let mut streams = Vec::new();
     let mut display_state = self.display_state_tracker.lock().await;
     let mut window_state = self.window_state_tracker.lock().await;
@@ -626,32 +642,31 @@ impl ScreencastBackend {
 
     for stream in iter {
       let Ok((id, source_type, data)) = stream.to_owned().downcast::<(u32, u32, OwnedValue)>() else {
-        continue;
+        tracing::debug!("failed to decode stream restore data");
+        return None;
       };
 
       match source_type {
         v if v == SourceType::Monitor as u32 => {
-          let Ok(match_string) = data.downcast_ref() else {
-            continue;
-          };
-
-          if let Some(monitor) = display_state.find_monitor(match_string) {
-            streams.push(ScreencastStream::Monitor {
-              id,
-              connector: monitor.connector.to_string(),
-              match_string: monitor.match_string(),
-            });
+          if !source_types.contains(SourceType::Monitor) {
+            return None;
           }
+
+          let monitor = display_state.find_monitor(data.downcast_ref().ok()?)?;
+          streams.push(ScreencastStream::Monitor {
+            id,
+            connector: monitor.connector.to_string(),
+            match_string: monitor.match_string(),
+          });
         }
         v if v == SourceType::Window as u32 => {
-          let Ok(s) = data.downcast_ref::<Structure>() else {
-            continue;
-          };
-          let Ok((app_id, title)): Result<(String, String), _> = s.try_into() else {
-            continue;
-          };
+          if !source_types.contains(SourceType::Window) {
+            return None;
+          }
 
-          for (wid, window) in window_state.windows().iter() {
+          let (app_id, title): (String, String) = data.downcast_ref::<Structure>().ok()?.try_into().ok()?;
+          let mut matched = false;
+          for (wid, window) in window_state.windows() {
             if window.app_id != app_id {
               continue;
             }
@@ -664,16 +679,21 @@ impl ScreencastBackend {
                 app_id,
                 title,
               });
+              matched = true;
               break;
             }
           }
+
+          if !matched {
+            return None;
+          }
         }
         v if v == SourceType::Virtual as u32 => {
-          continue;
+          return None;
         }
         v => {
           tracing::debug!("unknown source type: {}", v);
-          continue;
+          return None;
         }
       }
     }
