@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-ashpd = { version = "0.13.9", default-features = false, features = ["async-io", "backend", "screencast"] }
+ashpd = { git = "https://github.com/higherorderlogic/ashpd.git", default-features = false, features = ["async-io", "backend", "screencast"] }
 async-channel = "2.5.0"
 async-global-executor = "3.1.0"
 async-lock = "3.4.2"
