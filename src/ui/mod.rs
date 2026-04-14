@@ -14,7 +14,7 @@ use iced::{
   stream,
   wgpu::rwh::{RawDisplayHandle, RawWindowHandle},
   widget::{self, button, checkbox, column, container, grid, rich_text, row, scrollable, space, span, text},
-  window::{self, Level, close_requests},
+  window::{self, Level, close_requests, settings::PlatformSpecific},
 };
 use sctk::reexports::{
   client::{
@@ -32,6 +32,8 @@ use crate::{
   common::{PopupData, ScreencastStreamChoice, ToBackendMessage, ToUiMessage},
   ui::wayland::WaylandState,
 };
+
+const APP_ID: &str = "com.hol.kagayaku";
 
 #[derive(Clone, Copy)]
 enum IncludeType {
@@ -125,6 +127,10 @@ impl Daemon {
     tracing::info!("starting ui popup for {}", session_token);
 
     let (window_id, open_task) = window::open(window::Settings {
+      platform_specific: PlatformSpecific {
+        application_id: APP_ID.into(),
+        ..Default::default()
+      },
       size: Size::new(360.0, 660.0),
       position: window::Position::Centered,
       level: Level::AlwaysOnTop,
@@ -542,7 +548,7 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
     Daemon::view,
   )
   .settings(Settings {
-    id: Some("com.hol.kagayaku".into()),
+    id: Some(APP_ID.into()),
     ..Default::default()
   })
   .title(|daemon: &Daemon, _| {
