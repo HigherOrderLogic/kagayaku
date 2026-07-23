@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Error as AnyError};
 use regex::Regex;
 use zbus_xml::Node;
-use zbus_xmlgen::write_interfaces;
+use zbus_xmlgen::CodeGenerator;
 
 fn proxy_defaults(interface: &str) -> Option<(&'static str, Option<&'static str>)> {
   match interface {
@@ -60,7 +60,7 @@ fn main() -> Result<(), AnyError> {
     if !path.is_file() {
       continue;
     }
-    let (fdo_standard_ifaces, needed_ifaces): (Vec<_>, Vec<_>) = Node::from_reader(File::open(path.to_path_buf())?)?
+    let (fdo_standard_ifaces, needed_ifaces): (Vec<_>, Vec<_>) = Node::from_reader(File::open(&path)?)?
       .interfaces()
       .iter()
       .cloned()
@@ -70,16 +70,13 @@ fn main() -> Result<(), AnyError> {
       let mod_name = iface.name().as_str().to_lowercase().replace(".", "_");
       let iface_impl = apply_proxy_defaults(
         iface.name().as_str(),
-        write_interfaces(
+        CodeGenerator::new().with_format(true).file_code(
           slice::from_ref(&iface),
           &fdo_standard_ifaces,
-          None,
-          None,
-          path.to_str().context("failed to convert to string")?,
+          &path.to_string_lossy(),
           "build.rs",
           "build.rs",
-        )
-        .unwrap(),
+        )?,
       );
       interfaces_impl.push(format!("pub mod {} {{ {} }}", mod_name, iface_impl));
     }
