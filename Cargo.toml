@@ -11,7 +11,8 @@ async-global-executor = "3.1.0"
 async-lock = "3.4.2"
 async-trait = "0.1.91"
 futures-util = "0.3.33"
-iced = { version = "0.14.0", default-features = false, features = ["wayland","thread-pool", "wgpu", "web-colors"] }
+iced = { version = "0.14.0", default-features = false, features = ["wayland","thread-pool", "wgpu", "web-colors", "advanced"] }
+iced_palace = "0.14.0"
 sctk = { version = "0.20.0", package = "smithay-client-toolkit", default-features = false }
 tracing = { version = "0.1.44", features = ["attributes"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter"] }

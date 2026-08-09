@@ -9,13 +9,25 @@ use ashpd::{
 use async_channel::{Receiver, Sender};
 use futures_util::SinkExt;
 use iced::{
-  Alignment, Element, Font, Length, Settings, Size, Subscription, Task, daemon, exit,
+  Alignment, Element, Font, Length, Settings, Size, Subscription, Task,
+  advanced::{Renderer, text::Renderer as TextRenderer},
+  daemon, exit,
   font::Weight,
   stream,
   wgpu::rwh::{RawDisplayHandle, RawWindowHandle},
-  widget::{self, button, checkbox, column, container, grid, rich_text, row, scrollable, space, span, text},
+  widget::{
+    self, Button, button,
+    button::Catalog as ButtonCatalog,
+    checkbox,
+    checkbox::Catalog as CheckboxCatalog,
+    column, container,
+    container::Catalog as ContainerCatalog,
+    grid, rich_text, row, scrollable, space, span, text,
+    text::{Catalog as TextCatalog, Wrapping},
+  },
   window::{self, Level, close_requests, settings::PlatformSpecific},
 };
+use iced_palace::widget::ellipsized_text;
 use sctk::reexports::{
   client::{
     Connection, Proxy,
@@ -389,31 +401,19 @@ impl Daemon {
       for (connector, monitor) in &active_popup.monitors {
         let selected = active_popup.state.selected_monitors.contains(connector);
         let monitor_type = if monitor.builtin { "Built-in" } else { "External" };
-        let body_text = if let Some((width, height)) = monitor.size {
-          text!("{} display ({}x{})", monitor_type, width, height)
-        } else {
-          text!("{} display (unknown size)", monitor_type)
-        };
-
         choices.push(
-          button(
-            column![
-              container(checkbox(selected)).center(Length::Fill),
-              text!("{}", monitor.display_name.as_ref().unwrap_or(&monitor.product))
-                .font(Font {
-                  weight: Weight::Bold,
-                  ..Default::default()
-                })
-                .align_x(Alignment::Center)
-                .width(Length::Fill),
-              body_text.align_x(Alignment::Center).width(Length::Fill)
-            ]
-            .spacing(4),
-          )
-          .on_press(Message::ToggleChoice(
+          choice_button(
+            selected,
+            monitor.display_name.clone().unwrap_or_else(|| monitor.product.clone()),
+            format!(
+              "{} display ({})",
+              monitor_type,
+              monitor
+                .size
+                .map_or_else(|| "unknown size".into(), |(w, h)| format!("{}x{}", w, h))
+            ),
             ChoiceType::Monitor(connector.to_string()),
-            !selected,
-          ))
+          )
           .into(),
         );
       }
@@ -423,23 +423,12 @@ impl Daemon {
       for (window_id, window) in &active_popup.windows {
         let selected = active_popup.state.selected_windows.contains(window_id);
         choices.push(
-          button(
-            column![
-              container(checkbox(selected)).center(Length::Fill),
-              text!("{}", window.title)
-                .font(Font {
-                  weight: Weight::Bold,
-                  ..Default::default()
-                })
-                .align_x(Alignment::Center)
-                .width(Length::Fill),
-              text!("{}", window.app_id)
-                .align_x(Alignment::Center)
-                .width(Length::Fill)
-            ]
-            .spacing(4),
+          choice_button(
+            selected,
+            window.title.clone(),
+            window.app_id.clone(),
+            ChoiceType::Window(*window_id),
           )
-          .on_press(Message::ToggleChoice(ChoiceType::Window(*window_id), !selected))
           .into(),
         );
       }
@@ -512,6 +501,36 @@ impl Daemon {
       Subscription::none()
     }
   }
+}
+
+fn choice_button<'a, T, R>(
+  selected: bool,
+  title: String,
+  subtitle: String,
+  choice: ChoiceType,
+) -> Button<'a, Message, T, R>
+where
+  T: ButtonCatalog + CheckboxCatalog + ContainerCatalog + TextCatalog + 'a,
+  R: Renderer + TextRenderer + 'a,
+  <R as TextRenderer>::Font: From<Font>,
+  <R as TextRenderer>::Paragraph: Clone,
+{
+  button(
+    column![
+      container(checkbox(selected)).center(Length::Fill),
+      ellipsized_text(title)
+        .font(Font {
+          weight: Weight::Bold,
+          ..Default::default()
+        })
+        .align_x(Alignment::Center)
+        .wrapping(Wrapping::None)
+        .width(Length::Fill),
+      text(subtitle).size(12).align_x(Alignment::Center).width(Length::Fill)
+    ]
+    .spacing(4),
+  )
+  .on_press(Message::ToggleChoice(choice, !selected))
 }
 
 pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
