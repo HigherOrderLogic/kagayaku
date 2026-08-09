@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ashpd::{
-  desktop::{PersistMode, screencast::SourceType},
+  desktop::{HandleToken, PersistMode, screencast::SourceType},
   enumflags2::BitFlags,
 };
 use async_channel::Sender;
@@ -27,12 +27,13 @@ pub enum ToBackendMessage {
 
 pub enum ToUiMessage {
   NewPopup(PopupData),
-  CloseSession(String),
+  CloseSession(HandleToken),
+  CloseRequest(HandleToken),
 }
 
 #[derive(Clone)]
 pub struct PopupData {
-  pub session_token: String,
+  pub session_token: HandleToken,
   pub app_id: Option<String>,
   pub parent_window: Option<String>,
   pub backend_tx: Sender<ToBackendMessage>,

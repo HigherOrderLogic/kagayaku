@@ -280,6 +280,7 @@ pub struct ScreencastBackend {
   display_state_tracker: Arc<Mutex<DisplayStateTracker>>,
   window_state_tracker: Arc<Mutex<WindowStateTracker>>,
   sessions: Arc<Mutex<HashMap<HandleToken, ScreencastSession>>>,
+  request_sessions: Arc<Mutex<HashMap<HandleToken, HandleToken>>>,
   mutter_screencast_proxy: ScreenCastProxy<'static>,
   counter: AtomicU32,
 }
@@ -290,6 +291,7 @@ impl ScreencastBackend {
     let display_state_tracker = Mutex::new(DisplayStateTracker::new(&connection).await?).into();
     let window_state_tracker = Mutex::new(WindowStateTracker::new(&connection).await?).into();
     let sessions = Mutex::new(HashMap::new()).into();
+    let request_sessions = Mutex::new(HashMap::new()).into();
     let mutter_screencast_proxy = ScreenCastProxy::new(&connection).await?;
 
     Ok(Self {
@@ -298,6 +300,7 @@ impl ScreencastBackend {
       display_state_tracker,
       window_state_tracker,
       sessions,
+      request_sessions,
       mutter_screencast_proxy,
       counter: AtomicU32::new(0),
     })
@@ -306,9 +309,15 @@ impl ScreencastBackend {
 
 #[async_trait::async_trait]
 impl RequestImpl for ScreencastBackend {
-  #[instrument(skip_all, fields(token = %_token))]
-  async fn close(&self, _token: HandleToken) {
+  #[instrument(skip(self))]
+  async fn close(&self, token: HandleToken) {
     tracing::info!("closing request");
+
+    if let Some(session_token) = self.request_sessions.lock().await.remove(&token)
+      && let Err(e) = self.ui_tx.try_send(ToUiMessage::CloseRequest(session_token))
+    {
+      tracing::warn!("failed to send request close to UI thread: {}", e);
+    }
   }
 }
 
@@ -319,11 +328,9 @@ impl SessionImpl for ScreencastBackend {
     let mut sessions = self.sessions.lock().await;
     if let Some(session) = sessions.remove(&session_token) {
       tracing::info!("closing session");
+      self.request_sessions.lock().await.retain(|_, t| t != &session_token);
       drop(sessions);
-      if let Err(e) = self
-        .ui_tx
-        .try_send(ToUiMessage::CloseSession(session_token.to_string()))
-      {
+      if let Err(e) = self.ui_tx.try_send(ToUiMessage::CloseSession(session_token)) {
         tracing::warn!("failed to send close request to UI thread: {}", e);
       }
       if let Some(gnome_session) = session.gnome_session {
@@ -362,6 +369,7 @@ impl ScreencastImpl for ScreencastBackend {
   // TODO: support remote desktop session
   async fn select_sources(
     &self,
+    _: HandleToken,
     session_token: HandleToken,
     _: Option<MaybeAppID>,
     options: SelectSourcesOptions,
@@ -398,6 +406,7 @@ impl ScreencastImpl for ScreencastBackend {
   #[instrument(skip(self), fields(app_id = ?client_app_id))]
   async fn start_cast(
     &self,
+    token: HandleToken,
     session_token: HandleToken,
     client_app_id: Option<MaybeAppID>,
     window_identifier: Option<WindowIdentifierType>,
@@ -449,7 +458,7 @@ impl ScreencastImpl for ScreencastBackend {
       };
 
       let popup_data = PopupData {
-        session_token: session_token.to_string(),
+        session_token: session_token.clone(),
         app_id: client_app_id.map(|i| i.to_string()),
         parent_window: window_identifier.and_then(|ty| {
           if let WindowIdentifierType::Wayland(id) = ty {
@@ -466,11 +475,19 @@ impl ScreencastImpl for ScreencastBackend {
         windows,
       };
 
+      self
+        .request_sessions
+        .lock()
+        .await
+        .insert(token.clone(), session_token.clone());
+
       if let Err(e) = self.ui_tx.send(ToUiMessage::NewPopup(popup_data)).await {
+        self.request_sessions.lock().await.remove(&token);
         tracing::warn!("failed to send UI message: {}", e);
         return Err(PortalError::Failed(format!("cannot start UI: {}", e)));
       }
       let backend_msg = rx.recv().await;
+      self.request_sessions.lock().await.remove(&token);
 
       match backend_msg {
         Ok(s) => match s {

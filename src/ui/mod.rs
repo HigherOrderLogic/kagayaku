@@ -3,7 +3,7 @@ mod wayland;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use ashpd::{
-  desktop::{PersistMode, screencast::SourceType},
+  desktop::{HandleToken, PersistMode, screencast::SourceType},
   enumflags2::BitFlags,
 };
 use async_channel::{Receiver, Sender};
@@ -64,7 +64,8 @@ enum ChoiceType {
 enum Message {
   PopupReceived(Option<PopupData>),
   PopupCloseRequested(window::Id),
-  PopupSessionClosed(String),
+  PopupSessionClosed(HandleToken),
+  PopupRequestClosed(HandleToken),
   ToggleChoice(ChoiceType, bool),
   ToggleInclude(IncludeType, bool),
   ToggleRemember(bool),
@@ -73,6 +74,16 @@ enum Message {
   WaylandReady(Connection, WlSurface, String),
   Exit,
   None,
+}
+
+impl From<ToUiMessage> for Message {
+  fn from(value: ToUiMessage) -> Self {
+    match value {
+      ToUiMessage::NewPopup(d) => Self::PopupReceived(d.into()),
+      ToUiMessage::CloseSession(t) => Self::PopupSessionClosed(t),
+      ToUiMessage::CloseRequest(t) => Self::PopupRequestClosed(t),
+    }
+  }
 }
 
 struct State {
@@ -104,7 +115,7 @@ impl State {
 }
 
 struct ActivePopup {
-  session_token: String,
+  session_token: HandleToken,
   app_id: Option<String>,
   backend_tx: Sender<ToBackendMessage>,
   multiple: bool,
@@ -256,6 +267,17 @@ impl Daemon {
         }
 
         Task::none()
+      }
+      Message::PopupRequestClosed(session_token) => {
+        if let Some(active_popup) = self.active_popup.as_ref()
+          && active_popup.session_token == session_token
+        {
+          tracing::info!("popup cancelled by request close for session {}", session_token);
+          self.close_active_with(ToBackendMessage::Cancel)
+        } else {
+          self.queued_popups.retain(|p| p.session_token != session_token);
+          Task::none()
+        }
       }
       Message::ToggleChoice(choice_type, selected) => {
         let Some(active_popup) = self.active_popup.as_mut() else {
@@ -547,12 +569,7 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
           let mut stop = false;
           while !stop {
             match ui_rx_clone.recv().await {
-              Ok(ToUiMessage::NewPopup(d)) => {
-                out.send(Message::PopupReceived(Some(d))).await.unwrap();
-              }
-              Ok(ToUiMessage::CloseSession(t)) => {
-                out.send(Message::PopupSessionClosed(t)).await.unwrap();
-              }
+              Ok(m) => out.send(m.into()).await.unwrap(),
               Err(e) => {
                 tracing::info!("channel from backend closed: {}", e);
                 stop = true;
