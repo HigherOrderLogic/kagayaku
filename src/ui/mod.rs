@@ -6,7 +6,6 @@ use ashpd::{
   desktop::{PersistMode, screencast::SourceType},
   enumflags2::BitFlags,
 };
-use async_channel::{Receiver, Sender};
 use futures_util::SinkExt;
 use iced::{
   Alignment, Element, Font, Length, Settings, Size, Subscription, Task,
@@ -37,6 +36,7 @@ use sctk::reexports::{
   },
   protocols::xdg::foreign::zv2::client::zxdg_importer_v2::ZxdgImporterV2,
 };
+use smol::channel::{Receiver, Sender};
 use tracing::instrument;
 
 use crate::{

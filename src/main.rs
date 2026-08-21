@@ -2,14 +2,10 @@ mod backend;
 mod common;
 mod ui;
 
-use std::{
-  io::stderr,
-  thread::{Builder as ThreadBuilder, available_parallelism},
-};
+use std::{io::stderr, thread::Builder as ThreadBuilder};
 
 use anyhow::{Context, Error as AnyError};
-use async_channel::unbounded;
-use async_global_executor::{GlobalExecutorConfig, block_on, init_with_config};
+use smol::{block_on, channel::unbounded};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{backend::backend_main, ui::ui_main};
@@ -21,8 +17,6 @@ fn main() -> Result<(), AnyError> {
     )
     .with(fmt::layer().with_writer(stderr))
     .init();
-
-  init_with_config(GlobalExecutorConfig::default().with_max_threads(available_parallelism().map_or(1, |n| n.get())));
 
   let (tx, rx) = unbounded();
 

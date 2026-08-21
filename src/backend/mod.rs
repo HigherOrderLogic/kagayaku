@@ -28,11 +28,14 @@ use ashpd::{
   },
   enumflags2::BitFlags,
 };
-use async_channel::{Sender, unbounded};
-use async_lock::Mutex;
 use futures_util::{
   StreamExt,
   task::{FutureObj, Spawn, SpawnError},
+};
+use smol::{
+  channel::{Sender, unbounded},
+  lock::Mutex,
+  spawn,
 };
 use tracing::instrument;
 use zbus::{
@@ -65,7 +68,7 @@ struct GlobalExecutorSpawner;
 
 impl Spawn for GlobalExecutorSpawner {
   fn spawn_obj(&self, future: FutureObj<'static, ()>) -> Result<(), SpawnError> {
-    async_global_executor::spawn(future).detach();
+    spawn(future).detach();
     Ok(())
   }
 }

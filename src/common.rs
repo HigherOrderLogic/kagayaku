@@ -4,7 +4,7 @@ use ashpd::{
   desktop::{PersistMode, screencast::SourceType},
   enumflags2::BitFlags,
 };
-use async_channel::Sender;
+use smol::channel::Sender;
 
 use crate::backend::{display_tracker::Monitor, window_tracker::Window};
 
