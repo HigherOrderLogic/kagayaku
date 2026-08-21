@@ -88,6 +88,14 @@ pub async fn backend_main(tx: Sender<ToUiMessage>) -> Result<(), AnyError> {
   pending().await
 }
 
+fn mutter_cursor_mode(cursor_mode: CursorMode) -> u32 {
+  match cursor_mode {
+    CursorMode::Hidden => 0,
+    CursorMode::Embedded => 1,
+    CursorMode::Metadata => 2,
+  }
+}
+
 pub enum GnomeStreamRestoreData {
   Monitor { match_string: String },
   Window { app_id: String, title: String },
@@ -146,7 +154,7 @@ impl GnomeSession {
     cursor_mode: CursorMode,
   ) -> Result<(), ZbusError> {
     let mut props = HashMap::new();
-    let cursor_mode_value = (cursor_mode as u32).into();
+    let cursor_mode_value = mutter_cursor_mode(cursor_mode).into();
     props.insert("cursor-mode", &cursor_mode_value);
 
     let object_path = self.proxy.record_monitor(&connector, props).await?;
@@ -174,7 +182,7 @@ impl GnomeSession {
   ) -> Result<(), ZbusError> {
     let mut props = HashMap::new();
     let window_id_value = window_id.into();
-    let cursor_mode_value = (cursor_mode as u32).into();
+    let cursor_mode_value = mutter_cursor_mode(cursor_mode).into();
     props.insert("window-id", &window_id_value);
     props.insert("cursor-mode", &cursor_mode_value);
 
@@ -345,8 +353,7 @@ impl ScreencastImpl for ScreencastBackend {
   }
 
   fn available_cursor_mode(&self) -> BitFlags<CursorMode> {
-    // FIXME: ashpd 0.13.0-alpha cant deserialize metadata cursor mode (value 4)
-    CursorMode::Hidden | CursorMode::Embedded
+    CursorMode::Hidden | CursorMode::Embedded | CursorMode::Metadata
   }
 
   async fn create_session(
