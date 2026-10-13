@@ -7,8 +7,10 @@ edition = "2024"
 anyhow = "1.0.104"
 ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "backend", "screencast"] }
 async-trait = "0.1.91"
+freedesktop-icons = "0.4.0"
+freedesktop_entry_parser = "2.0.1"
 futures-util = "0.3.33"
-iced = { version = "0.14.0", default-features = false, features = ["wayland", "smol", "wgpu", "web-colors", "advanced"] }
+iced = { version = "0.14.0", default-features = false, features = ["wayland", "smol", "wgpu", "web-colors", "svg", "image", "advanced"] }
 iced_palace = "0.14.0"
 sctk = { version = "0.20.0", package = "smithay-client-toolkit", default-features = false }
 smol = "2.0.2"

@@ -1,27 +1,43 @@
 mod wayland;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+  collections::{HashMap, HashSet, VecDeque},
+  env::var,
+  iter,
+  path::{Path, PathBuf},
+  process::Command,
+  sync::{Arc, LazyLock},
+};
 
 use ashpd::{
   desktop::{PersistMode, screencast::SourceType},
   enumflags2::BitFlags,
 };
-use futures_util::SinkExt;
+use freedesktop_entry_parser::Entry;
+use freedesktop_icons::{default_theme_gtk, lookup};
+use futures_util::{AsyncReadExt, SinkExt};
 use iced::{
   Alignment, Element, Font, Length, Settings, Size, Subscription, Task,
-  advanced::{Renderer, text::Renderer as TextRenderer},
+  advanced::{
+    Renderer,
+    image::{Handle as ImageHandle, Renderer as ImageRenderer},
+    svg::{Handle as SvgHandle, Renderer as SvgRenderer},
+    text::Renderer as TextRenderer,
+  },
   daemon, exit,
   font::Weight,
   stream,
   wgpu::rwh::{RawDisplayHandle, RawWindowHandle},
   widget::{
     self, Button, button,
-    button::Catalog as ButtonCatalog,
+    button::{Catalog as ButtonCatalog, StyleFn as ButtonStyleFn},
     checkbox,
     checkbox::Catalog as CheckboxCatalog,
     column, container,
     container::Catalog as ContainerCatalog,
-    grid, rich_text, row, scrollable, space, span, text,
+    grid, image, rich_text, row, scrollable, space, span, svg,
+    svg::Catalog as SvgCatalog,
+    text,
     text::{Catalog as TextCatalog, Wrapping},
   },
   window::{self, Level, close_requests, settings::PlatformSpecific},
@@ -36,7 +52,12 @@ use sctk::reexports::{
   },
   protocols::xdg::foreign::zv2::client::zxdg_importer_v2::ZxdgImporterV2,
 };
-use smol::channel::{Receiver, Sender};
+use smol::{
+  channel::{Receiver, Sender},
+  fs::{OpenOptions, metadata},
+  lock::RwLock,
+  unblock,
+};
 use tracing::instrument;
 
 use crate::{
@@ -46,6 +67,89 @@ use crate::{
 };
 
 const APP_ID: &str = "com.hol.kagayaku";
+
+static DEFAULT_ICON_THEME: LazyLock<Option<String>> = LazyLock::new(|| {
+  default_theme_gtk().or_else(|| {
+    ["kreadconfig6", "kreadconfig5"].into_iter().find_map(|cmd| {
+      Command::new(cmd)
+        .args(["--file", "kdeglobals", "--group", "Icons", "--key", "Theme"])
+        .output()
+        .ok()
+        .and_then(|out| {
+          if out.status.success() {
+            let theme = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if theme.is_empty() { None } else { theme.into() }
+          } else {
+            None
+          }
+        })
+    })
+  })
+});
+static IMAGE_MISSING_ICON: LazyLock<Option<Icon>> = LazyLock::new(|| find_icon("image-missing").map(Icon::new));
+static COMPUTER_LAPTOP_ICON: LazyLock<Option<Icon>> = LazyLock::new(|| {
+  find_icon("computer-laptop")
+    .map(Icon::new)
+    .or_else(|| IMAGE_MISSING_ICON.clone())
+});
+static DESKTOP_DISPLAY_ICON: LazyLock<Option<Icon>> = LazyLock::new(|| {
+  find_icon("preferences-desktop-display")
+    .map(Icon::new)
+    .or_else(|| IMAGE_MISSING_ICON.clone())
+});
+
+static DESKTOP_PATHS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+  let mut paths = Vec::new();
+
+  if let Ok(s) = var("XDG_DATA_HOME").or_else(|_| var("HOME").map(|h| format!("{}/.local/share", h))) {
+    paths.push(s);
+  }
+  paths.extend(
+    var("XDG_DATA_DIRS")
+      .unwrap_or_else(|_| "/usr/local/share:/usr/share".into())
+      .split(':')
+      .map(Into::into),
+  );
+
+  paths
+    .into_iter()
+    .map(|s| PathBuf::from(s).join("applications"))
+    .collect()
+});
+
+async fn get_app_icon_name(desktop_name: impl AsRef<Path>) -> Option<String> {
+  for p in DESKTOP_PATHS.iter() {
+    let file_path = p.join(&desktop_name);
+    if !metadata(&file_path).await.is_ok_and(|m| m.is_file()) {
+      continue;
+    }
+
+    let mut content = String::new();
+    let Ok(mut f) = OpenOptions::new().read(true).open(file_path).await else {
+      continue;
+    };
+    if f.read_to_string(&mut content).await.is_err() {
+      continue;
+    }
+
+    let Ok(e) = Entry::parse(content.as_bytes()) else {
+      continue;
+    };
+    return e.section("Desktop Entry").and_then(|s| s.attr("Icon").first().cloned());
+  }
+
+  None
+}
+
+fn find_icon(icon_name: impl AsRef<str>) -> Option<PathBuf> {
+  let builder = lookup(icon_name.as_ref()).force_svg().with_size(48);
+
+  if let Some(t) = DEFAULT_ICON_THEME.as_ref() {
+    builder.with_theme(t).find()
+  } else {
+    builder.find()
+  }
+}
 
 #[derive(Clone, Copy)]
 enum IncludeType {
@@ -70,6 +174,7 @@ enum Message {
   ToggleRemember(bool),
   Cancel,
   Share,
+  SetAppIcon(u64, Option<Icon>),
   WaylandReady(Connection, WlSurface, String),
   Exit,
   None,
@@ -103,6 +208,17 @@ impl State {
   }
 }
 
+struct WindowChoice {
+  window: Window,
+  icon: Option<Icon>,
+}
+
+impl From<Window> for WindowChoice {
+  fn from(window: Window) -> Self {
+    Self { window, icon: None }
+  }
+}
+
 struct ActivePopup {
   session_token: String,
   app_id: Option<String>,
@@ -111,7 +227,7 @@ struct ActivePopup {
   source_type: BitFlags<SourceType, u32>,
   persist_mode: PersistMode,
   monitors: HashMap<String, Monitor>,
-  windows: HashMap<u64, Window>,
+  windows: HashMap<u64, WindowChoice>,
   state: State,
   window_id: window::Id,
   parent_set: bool,
@@ -120,6 +236,7 @@ struct ActivePopup {
 struct Daemon {
   active_popup: Option<ActivePopup>,
   queued_popups: VecDeque<PopupData>,
+  icons_cache: Arc<RwLock<HashMap<String, Option<Icon>>>>,
 }
 
 impl Daemon {
@@ -150,6 +267,27 @@ impl Daemon {
       ..Default::default()
     });
 
+    let icons_cache = self.icons_cache.clone();
+    let tasks = windows.clone().into_iter().map(move |(k, w)| {
+      let icons_cache_clone = icons_cache.clone();
+      Task::future(async move {
+        let icon = if let Some(i) = icons_cache_clone.read().await.get(&w.app_id) {
+          i.clone()
+        } else {
+          let icon = if let Some(n) = get_app_icon_name(&w.app_id).await {
+            unblock(move || find_icon(n)).await.map(Icon::new)
+          } else {
+            IMAGE_MISSING_ICON.clone()
+          };
+
+          icons_cache_clone.write().await.insert(w.app_id, icon.clone());
+          icon
+        };
+
+        Message::SetAppIcon(k, icon)
+      })
+    });
+
     self.active_popup = Some(ActivePopup {
       session_token,
       app_id,
@@ -158,13 +296,13 @@ impl Daemon {
       source_type,
       persist_mode,
       monitors,
-      windows,
+      windows: windows.into_iter().map(|(k, v)| (k, v.into())).collect(),
       state: Default::default(),
       window_id,
       parent_set: false,
     });
 
-    open_task.then(move |id| {
+    Task::batch(tasks.chain(iter::once(open_task.then(move |id| {
       if let Some(parent) = parent_window.clone() {
         window::run(id, |w| {
           let Ok(RawWindowHandle::Wayland(window_handle)) = w.window_handle().map(|h| h.as_raw()) else {
@@ -190,7 +328,7 @@ impl Daemon {
         tracing::info!("no parent window to associate");
         Task::none()
       }
-    })
+    }))))
   }
 
   fn close_active_with(&mut self, backend_message: ToBackendMessage) -> Task<Message> {
@@ -334,14 +472,25 @@ impl Daemon {
           if let Some(window) = active_popup.windows.get(window_id) {
             choices.push(ScreencastStreamChoice::Window {
               window_id: *window_id,
-              app_id: window.app_id.to_string(),
-              title: window.title.to_string(),
+              app_id: window.window.app_id.to_string(),
+              title: window.window.title.to_string(),
             });
           }
         }
         tracing::info!("sharing screencast request");
 
         self.close_active_with(ToBackendMessage::Success((active_popup.state.remember_choice, choices)))
+      }
+      Message::SetAppIcon(k, v) => {
+        let Some(active_popup) = self.active_popup.as_mut() else {
+          return Task::none();
+        };
+
+        if let Some(w) = active_popup.windows.get_mut(&k) {
+          w.icon = v;
+        }
+
+        Task::none()
       }
       Message::WaylandReady(conn, surface, parent) => {
         let Ok((globals, event_queue)) = registry_queue_init::<WaylandState>(&conn) else {
@@ -401,6 +550,11 @@ impl Daemon {
       for (connector, monitor) in &active_popup.monitors {
         let selected = active_popup.state.selected_monitors.contains(connector);
         let monitor_type = if monitor.builtin { "Built-in" } else { "External" };
+        let monitor_icon = if monitor.builtin {
+          COMPUTER_LAPTOP_ICON.clone()
+        } else {
+          DESKTOP_DISPLAY_ICON.clone()
+        };
         choices.push(
           choice_button(
             selected,
@@ -410,9 +564,10 @@ impl Daemon {
               monitor_type,
               monitor
                 .size
-                .map_or_else(|| "unknown size".into(), |(w, h)| format!("{}x{}", w, h))
+                .map_or_else(|| "unknown size".into(), |(w, h)| format!("{}x{}", w, h)),
             ),
             ChoiceType::Monitor(connector.to_string()),
+            monitor_icon,
           )
           .into(),
         );
@@ -425,9 +580,10 @@ impl Daemon {
         choices.push(
           choice_button(
             selected,
-            window.title.clone(),
-            window.app_id.clone(),
+            window.window.title.clone(),
+            window.window.app_id.clone(),
             ChoiceType::Window(*window_id),
+            window.icon.clone(),
           )
           .into(),
         );
@@ -503,21 +659,63 @@ impl Daemon {
   }
 }
 
+#[derive(Clone)]
+enum Icon {
+  Svg(SvgHandle),
+  Raster(ImageHandle),
+}
+
+impl Icon {
+  fn new(p: impl AsRef<Path>) -> Self {
+    let path = p.as_ref();
+    if let Some(ext) = path.extension()
+      && ext.to_string_lossy() == "svg"
+    {
+      Self::Svg(SvgHandle::from_path(path))
+    } else {
+      Self::Raster(ImageHandle::from_path(path))
+    }
+  }
+}
+
+impl<'a, M, T, R> From<Icon> for Element<'a, M, T, R>
+where
+  R: SvgRenderer + ImageRenderer,
+  T: SvgCatalog + 'a,
+  M: 'a,
+  <R as ImageRenderer>::Handle: From<ImageHandle> + 'a,
+{
+  fn from(value: Icon) -> Element<'a, M, T, R> {
+    match value {
+      Icon::Svg(handle) => Element::new(svg(handle).width(48).height(48)),
+      Icon::Raster(handle) => Element::new(image(handle).width(48).height(48)),
+    }
+  }
+}
+
 fn choice_button<'a, T, R>(
   selected: bool,
   title: String,
   subtitle: String,
   choice: ChoiceType,
+  icon: Option<Icon>,
 ) -> Button<'a, Message, T, R>
 where
-  T: ButtonCatalog + CheckboxCatalog + ContainerCatalog + TextCatalog + 'a,
-  R: Renderer + TextRenderer + 'a,
+  T: ButtonCatalog + CheckboxCatalog + ContainerCatalog + SvgCatalog + TextCatalog + 'a,
+  <T as ButtonCatalog>::Class<'a>: From<ButtonStyleFn<'a, T>>,
+  R: Renderer + ImageRenderer + SvgRenderer + TextRenderer + 'a,
+  <R as ImageRenderer>::Handle: From<ImageHandle> + 'a,
   <R as TextRenderer>::Font: From<Font>,
   <R as TextRenderer>::Paragraph: Clone,
 {
+  let center: Element<'_, _, _, _> = if let Some(i) = icon {
+    i.into()
+  } else {
+    space().height(Length::Fill).into()
+  };
   button(
     column![
-      container(checkbox(selected)).center(Length::Fill),
+      container(center).center(Length::Fill),
       ellipsized_text(title)
         .font(Font {
           weight: Weight::Bold,
@@ -531,6 +729,16 @@ where
     .spacing(4),
   )
   .on_press(Message::ToggleChoice(choice, !selected))
+  .style(move |theme: &T, status| {
+    let mut style = ButtonCatalog::style(theme, &<T as ButtonCatalog>::default(), status);
+
+    if selected {
+      style.border.width = 2.;
+      style.border.color = style.text_color.inverse();
+    }
+
+    style
+  })
 }
 
 pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
@@ -542,6 +750,7 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
         Daemon {
           active_popup: None,
           queued_popups: VecDeque::new(),
+          icons_cache: RwLock::new(HashMap::new()).into(),
         },
         Task::stream(stream::channel(10, async move |mut out| {
           let mut stop = false;
