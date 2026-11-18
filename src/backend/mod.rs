@@ -26,7 +26,6 @@ use ashpd::{
       CursorMode, SelectSourcesOptions, SourceType, StartCastOptions, StreamBuilder, Streams, StreamsBuilder,
     },
   },
-  enumflags2::BitFlags,
 };
 use futures_util::{
   StreamExt,
@@ -39,9 +38,8 @@ use smol::{
 };
 use tracing::instrument;
 use zbus::{
-  Connection, Error as ZbusError,
+  Array, Connection, Error as ZbusError, OwnedObjectPath, OwnedVariant, Signature, Structure, Variant,
   fdo::RequestNameFlags,
-  zvariant::{Array, OwnedObjectPath, OwnedValue, Signature, Structure, Value},
 };
 
 use crate::{
@@ -76,7 +74,9 @@ impl Spawn for GlobalExecutorSpawner {
 pub async fn backend_main(tx: Sender<ToUiMessage>) -> Result<(), AnyError> {
   Builder::new("org.freedesktop.impl.portal.desktop.kagayaku")
     .context("failed to create builder")?
-    .with_flags(RequestNameFlags::AllowReplacement | RequestNameFlags::DoNotQueue | RequestNameFlags::ReplaceExisting)
+    .with_flags(
+      RequestNameFlags::ALLOW_REPLACEMENT | RequestNameFlags::DO_NOT_QUEUE | RequestNameFlags::REPLACE_EXISTING,
+    )
     .with_spawn(GlobalExecutorSpawner)
     .screencast(ScreencastBackend::new(tx).await?)
     .build()
@@ -90,9 +90,10 @@ pub async fn backend_main(tx: Sender<ToUiMessage>) -> Result<(), AnyError> {
 
 fn mutter_cursor_mode(cursor_mode: CursorMode) -> u32 {
   match cursor_mode {
-    CursorMode::Hidden => 0,
-    CursorMode::Embedded => 1,
-    CursorMode::Metadata => 2,
+    CursorMode::HIDDEN => 0,
+    CursorMode::EMBEDDED => 1,
+    CursorMode::METADATA => 2,
+    _ => 0,
   }
 }
 
@@ -162,7 +163,7 @@ impl GnomeSession {
       .new_stream(
         connection,
         id,
-        SourceType::Monitor,
+        SourceType::MONITOR,
         object_path,
         GnomeStreamRestoreData::Monitor { match_string },
       )
@@ -191,7 +192,7 @@ impl GnomeSession {
       .new_stream(
         connection,
         id,
-        SourceType::Window,
+        SourceType::WINDOW,
         object_path,
         GnomeStreamRestoreData::Window { app_id, title },
       )
@@ -266,18 +267,18 @@ pub enum ScreencastStream {
 struct ScreencastSession {
   multiple: bool,
   cursor_mode: CursorMode,
-  source_type: BitFlags<SourceType>,
+  source_type: SourceType,
   persist_mode: PersistMode,
   gnome_session: Option<GnomeSession>,
-  restore_data: Option<OwnedValue>,
+  restore_data: Option<OwnedVariant>,
 }
 
 impl Default for ScreencastSession {
   fn default() -> Self {
     Self {
       multiple: false,
-      cursor_mode: CursorMode::Hidden,
-      source_type: SourceType::Monitor.into(),
+      cursor_mode: CursorMode::HIDDEN,
+      source_type: SourceType::MONITOR,
       persist_mode: PersistMode::DoNot,
       gnome_session: None,
       restore_data: None,
@@ -345,12 +346,12 @@ impl SessionImpl for ScreencastBackend {
 
 #[async_trait::async_trait]
 impl ScreencastImpl for ScreencastBackend {
-  fn available_source_types(&self) -> BitFlags<SourceType> {
-    SourceType::Monitor | SourceType::Window
+  fn available_source_types(&self) -> SourceType {
+    SourceType::MONITOR | SourceType::WINDOW
   }
 
-  fn available_cursor_mode(&self) -> BitFlags<CursorMode> {
-    CursorMode::Hidden | CursorMode::Embedded | CursorMode::Metadata
+  fn available_cursor_mode(&self) -> CursorMode {
+    CursorMode::HIDDEN | CursorMode::EMBEDDED | CursorMode::METADATA
   }
 
   async fn create_session(
@@ -369,6 +370,7 @@ impl ScreencastImpl for ScreencastBackend {
   // TODO: support remote desktop session
   async fn select_sources(
     &self,
+    _: HandleToken,
     session_token: HandleToken,
     _: Option<MaybeAppID>,
     options: SelectSourcesOptions,
@@ -388,7 +390,7 @@ impl ScreencastImpl for ScreencastBackend {
       session.persist_mode = p;
     }
     if let Some(s) = options.sources() {
-      session.source_type = if s.is_empty() { SourceType::Monitor.into() } else { s };
+      session.source_type = if s.is_empty() { SourceType::MONITOR } else { s };
     }
 
     if session.persist_mode != PersistMode::DoNot
@@ -405,6 +407,7 @@ impl ScreencastImpl for ScreencastBackend {
   #[instrument(skip(self), fields(app_id = ?client_app_id))]
   async fn start_cast(
     &self,
+    _: HandleToken,
     session_token: HandleToken,
     client_app_id: Option<MaybeAppID>,
     window_identifier: Option<WindowIdentifierType>,
@@ -540,7 +543,7 @@ impl ScreencastImpl for ScreencastBackend {
           connector,
           match_string,
         } => {
-          if session.source_type.contains(SourceType::Monitor) {
+          if session.source_type.contains(SourceType::MONITOR) {
             gnome_session
               .record_monitor(
                 &self.connection,
@@ -558,7 +561,7 @@ impl ScreencastImpl for ScreencastBackend {
           app_id,
           title,
         } => {
-          if session.source_type.contains(SourceType::Window) {
+          if session.source_type.contains(SourceType::WINDOW) {
             gnome_session
               .record_window(
                 &self.connection,
@@ -601,12 +604,12 @@ impl ScreencastImpl for ScreencastBackend {
 
         if should_return_restore_data {
           let stream_data = match &stream.restore_data {
-            GnomeStreamRestoreData::Monitor { match_string } => Value::from(match_string.to_string()),
-            GnomeStreamRestoreData::Window { app_id, title } => Value::from((app_id.to_string(), title.to_string())),
+            GnomeStreamRestoreData::Monitor { match_string } => Variant::from(match_string.to_string()),
+            GnomeStreamRestoreData::Window { app_id, title } => Variant::from((app_id.to_string(), title.to_string())),
           };
 
           restore_data
-            .append((stream.id, stream.source_type as u32, stream_data).into())
+            .append((stream.id, stream.source_type.bits(), stream_data).into())
             .unwrap();
         }
       }
@@ -618,7 +621,7 @@ impl ScreencastImpl for ScreencastBackend {
       resp = resp.persist_mode(Some(session.persist_mode)).restore_data(Some((
         RESTORE_DATA_PROVIDER.to_string(),
         RESTORE_DATA_VERSION,
-        Value::from((creation_time, last_used_time, restore_data))
+        Variant::from((creation_time, last_used_time, restore_data))
           .try_into_owned()
           .unwrap(),
       )));
@@ -633,8 +636,8 @@ impl ScreencastImpl for ScreencastBackend {
 impl ScreencastBackend {
   async fn restore_streams<'a>(
     &'a self,
-    iter: impl Iterator<Item = &'a Value<'a>>,
-    source_types: BitFlags<SourceType>,
+    iter: impl Iterator<Item = &'a Variant<'a>>,
+    source_types: SourceType,
   ) -> Option<Vec<ScreencastStream>> {
     let mut streams = Vec::new();
     let mut display_state = self.display_state_tracker.lock().await;
@@ -648,14 +651,14 @@ impl ScreencastBackend {
     }
 
     for stream in iter {
-      let Ok((id, source_type, data)) = stream.to_owned().downcast::<(u32, u32, OwnedValue)>() else {
+      let Ok((id, source_type, data)) = stream.to_owned().downcast::<(u32, u32, OwnedVariant)>() else {
         tracing::debug!("failed to decode stream restore data");
         return None;
       };
 
       match source_type {
-        v if v == SourceType::Monitor as u32 => {
-          if !source_types.contains(SourceType::Monitor) {
+        v if v == SourceType::MONITOR.bits() => {
+          if !source_types.contains(SourceType::MONITOR) {
             return None;
           }
 
@@ -666,8 +669,8 @@ impl ScreencastBackend {
             match_string: monitor.match_string(),
           });
         }
-        v if v == SourceType::Window as u32 => {
-          if !source_types.contains(SourceType::Window) {
+        v if v == SourceType::WINDOW.bits() => {
+          if !source_types.contains(SourceType::WINDOW) {
             return None;
           }
 
@@ -695,7 +698,7 @@ impl ScreencastBackend {
             return None;
           }
         }
-        v if v == SourceType::Virtual as u32 => {
+        v if v == SourceType::VIRTUAL.bits() => {
           return None;
         }
         v => {

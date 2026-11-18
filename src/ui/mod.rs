@@ -9,10 +9,7 @@ use std::{
   sync::{Arc, LazyLock},
 };
 
-use ashpd::{
-  desktop::{HandleToken, PersistMode, screencast::SourceType},
-  enumflags2::BitFlags,
-};
+use ashpd::desktop::{HandleToken, PersistMode, screencast::SourceType};
 use freedesktop_entry_parser::Entry;
 use freedesktop_icons::{default_theme_gtk, lookup};
 use futures_util::{AsyncReadExt, SinkExt};
@@ -224,7 +221,7 @@ struct ActivePopup {
   app_id: Option<String>,
   backend_tx: Sender<ToBackendMessage>,
   multiple: bool,
-  source_type: BitFlags<SourceType, u32>,
+  source_type: SourceType,
   persist_mode: PersistMode,
   monitors: HashMap<String, Monitor>,
   windows: HashMap<u64, WindowChoice>,
@@ -546,7 +543,7 @@ impl Daemon {
 
     let mut choices: Vec<Element<'_, Message>> = Vec::new();
 
-    if active_popup.source_type.contains(SourceType::Monitor) && active_popup.state.include_monitor {
+    if active_popup.source_type.contains(SourceType::MONITOR) && active_popup.state.include_monitor {
       for (connector, monitor) in &active_popup.monitors {
         let selected = active_popup.state.selected_monitors.contains(connector);
         let monitor_type = if monitor.builtin { "Built-in" } else { "External" };
@@ -574,7 +571,7 @@ impl Daemon {
       }
     }
 
-    if active_popup.source_type.contains(SourceType::Window) && active_popup.state.include_window {
+    if active_popup.source_type.contains(SourceType::WINDOW) && active_popup.state.include_window {
       for (window_id, window) in &active_popup.windows {
         let selected = active_popup.state.selected_windows.contains(window_id);
         choices.push(
@@ -595,9 +592,10 @@ impl Daemon {
 
     for source_type in active_popup.source_type {
       let (state, label, include_type) = match source_type {
-        SourceType::Monitor => (active_popup.state.include_monitor, "Monitor", IncludeType::Monitor),
-        SourceType::Window => (active_popup.state.include_window, "Window", IncludeType::Window),
-        SourceType::Virtual => (active_popup.state.include_virtual, "Virtual", IncludeType::Virtual),
+        SourceType::MONITOR => (active_popup.state.include_monitor, "Monitor", IncludeType::Monitor),
+        SourceType::WINDOW => (active_popup.state.include_window, "Window", IncludeType::Window),
+        SourceType::VIRTUAL => (active_popup.state.include_virtual, "Virtual", IncludeType::Virtual),
+        _ => continue,
       };
 
       filter_children.push(

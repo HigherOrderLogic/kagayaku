@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 
-use ashpd::{
-  desktop::{HandleToken, PersistMode, screencast::SourceType},
-  enumflags2::BitFlags,
-};
+use ashpd::desktop::{HandleToken, PersistMode, screencast::SourceType};
 use smol::channel::Sender;
 
 use crate::backend::{display_tracker::Monitor, window_tracker::Window};
@@ -37,7 +34,7 @@ pub struct PopupData {
   pub parent_window: Option<String>,
   pub backend_tx: Sender<ToBackendMessage>,
   pub multiple: bool,
-  pub source_type: BitFlags<SourceType>,
+  pub source_type: SourceType,
   pub persist_mode: PersistMode,
   pub monitors: HashMap<String, Monitor>,
   pub windows: HashMap<u64, Window>,
