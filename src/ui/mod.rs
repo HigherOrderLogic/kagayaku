@@ -228,7 +228,6 @@ struct ActivePopup {
   windows: HashMap<u64, WindowChoice>,
   state: State,
   window_id: window::Id,
-  parent_set: bool,
 }
 
 struct Daemon {
@@ -297,7 +296,6 @@ impl Daemon {
       windows: windows.into_iter().map(|(k, v)| (k, v.into())).collect(),
       state: Default::default(),
       window_id,
-      parent_set: false,
     });
 
     Task::batch(tasks.chain(iter::once(open_task.then(move |id| {
@@ -374,24 +372,17 @@ impl Daemon {
         self.close_active_with(ToBackendMessage::Cancel)
       }
       Message::PopupSessionClosed(session_token) => {
-        if let Some(active_popup) = self.active_popup.as_ref()
-          && active_popup.session_token == session_token
+        if self
+          .active_popup
+          .as_ref()
+          .is_some_and(|p| p.session_token == session_token)
         {
-          if active_popup.parent_set {
-            tracing::info!(
-              "popup for session {} is associated with a parent, ignoring",
-              session_token
-            );
-            return Task::none();
-          } else {
-            tracing::info!("popup cancelled by backend for session {}", session_token);
-            return self.close_active_with(ToBackendMessage::Cancel);
-          }
+          tracing::info!("popup cancelled by backend for session {}", session_token);
+          self.close_active_with(ToBackendMessage::Cancel)
         } else {
           self.queued_popups.retain(|p| p.session_token != session_token);
+          Task::none()
         }
-
-        Task::none()
       }
       Message::PopupRequestClosed(session_token) => {
         if self
@@ -513,8 +504,6 @@ impl Daemon {
           importer.import_toplevel(parent, &qh, ()).set_parent_of(&surface);
           if let Err(e) = event_queue.flush() {
             tracing::warn!("failed to send Wayland request to compositor: {}", e);
-          } else if let Some(popup) = self.active_popup.as_mut() {
-            popup.parent_set = true;
           }
         } else {
           tracing::warn!("failed to bind {}", ZxdgImporterV2::interface().name);
