@@ -331,10 +331,7 @@ impl SessionImpl for ScreencastBackend {
     if let Some(session) = sessions.remove(&session_token) {
       tracing::info!("closing session");
       drop(sessions);
-      if let Err(e) = self
-        .ui_tx
-        .try_send(ToUiMessage::CloseSession(session_token.to_string()))
-      {
+      if let Err(e) = self.ui_tx.try_send(ToUiMessage::CloseSession(session_token)) {
         tracing::warn!("failed to send close request to UI thread: {}", e);
       }
       if let Some(gnome_session) = session.gnome_session {
@@ -459,7 +456,7 @@ impl ScreencastImpl for ScreencastBackend {
       };
 
       let popup_data = PopupData {
-        session_token: session_token.to_string(),
+        session_token: session_token.clone(),
         app_id: client_app_id.map(|i| i.to_string()),
         parent_window: window_identifier.and_then(|ty| {
           if let WindowIdentifierType::Wayland(id) = ty {

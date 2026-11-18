@@ -10,7 +10,7 @@ use std::{
 };
 
 use ashpd::{
-  desktop::{PersistMode, screencast::SourceType},
+  desktop::{HandleToken, PersistMode, screencast::SourceType},
   enumflags2::BitFlags,
 };
 use freedesktop_entry_parser::Entry;
@@ -168,7 +168,7 @@ enum ChoiceType {
 enum Message {
   PopupReceived(Option<PopupData>),
   PopupCloseRequested(window::Id),
-  PopupSessionClosed(String),
+  PopupSessionClosed(HandleToken),
   ToggleChoice(ChoiceType, bool),
   ToggleInclude(IncludeType, bool),
   ToggleRemember(bool),
@@ -220,7 +220,7 @@ impl From<Window> for WindowChoice {
 }
 
 struct ActivePopup {
-  session_token: String,
+  session_token: HandleToken,
   app_id: Option<String>,
   backend_tx: Sender<ToBackendMessage>,
   multiple: bool,
