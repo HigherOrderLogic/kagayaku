@@ -271,6 +271,7 @@ struct ScreencastSession {
   persist_mode: PersistMode,
   gnome_session: Option<GnomeSession>,
   restore_data: Option<OwnedVariant>,
+  request_token: Option<HandleToken>,
 }
 
 impl Default for ScreencastSession {
@@ -282,6 +283,7 @@ impl Default for ScreencastSession {
       persist_mode: PersistMode::DoNot,
       gnome_session: None,
       restore_data: None,
+      request_token: None,
     }
   }
 }
@@ -318,9 +320,22 @@ impl ScreencastBackend {
 
 #[async_trait::async_trait]
 impl RequestImpl for ScreencastBackend {
-  #[instrument(skip_all, fields(token = %_token))]
-  async fn close(&self, _token: HandleToken) {
+  #[instrument(skip(self))]
+  async fn close(&self, token: HandleToken) {
     tracing::info!("closing request");
+
+    let Some(session_token) = ({
+      let sessions = self.sessions.lock().await;
+      sessions
+        .iter()
+        .find_map(|(t, s)| s.request_token.as_ref().is_some_and(|t| t == &token).then(|| t.clone()))
+    }) else {
+      return;
+    };
+
+    if let Err(e) = self.ui_tx.try_send(ToUiMessage::RequestClosed(session_token)) {
+      tracing::warn!("failed to send close request to UI thread: {}", e);
+    }
   }
 }
 
@@ -407,7 +422,7 @@ impl ScreencastImpl for ScreencastBackend {
   #[instrument(skip(self), fields(app_id = ?client_app_id))]
   async fn start_cast(
     &self,
-    _: HandleToken,
+    token: HandleToken,
     session_token: HandleToken,
     client_app_id: Option<MaybeAppID>,
     window_identifier: Option<WindowIdentifierType>,
@@ -415,10 +430,11 @@ impl ScreencastImpl for ScreencastBackend {
   ) -> Result<Streams, PortalError> {
     tracing::info!("starting screencast session");
 
-    let sessions = self.sessions.lock().await;
-    let Some(session) = sessions.get(&session_token) else {
+    let mut sessions = self.sessions.lock().await;
+    let Some(session) = sessions.get_mut(&session_token) else {
       return Err(PortalError::InvalidArgument("unknown session token".into()));
     };
+    session.request_token = Some(token);
 
     let session_path = self.mutter_screencast_proxy.create_session(HashMap::new()).await?;
     let mut gnome_session = GnomeSession::new(&self.connection, session_path).await?;

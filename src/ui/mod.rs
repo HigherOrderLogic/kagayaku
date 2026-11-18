@@ -166,6 +166,7 @@ enum Message {
   PopupReceived(Option<PopupData>),
   PopupCloseRequested(window::Id),
   PopupSessionClosed(HandleToken),
+  PopupRequestClosed(HandleToken),
   ToggleChoice(ChoiceType, bool),
   ToggleInclude(IncludeType, bool),
   ToggleRemember(bool),
@@ -391,6 +392,19 @@ impl Daemon {
         }
 
         Task::none()
+      }
+      Message::PopupRequestClosed(session_token) => {
+        if self
+          .active_popup
+          .as_ref()
+          .is_some_and(|p| p.session_token == session_token)
+        {
+          tracing::info!("popup closed by request for session {}", session_token);
+          self.close_active_with(ToBackendMessage::Cancel)
+        } else {
+          self.queued_popups.retain(|p| p.session_token != session_token);
+          Task::none()
+        }
       }
       Message::ToggleChoice(choice_type, selected) => {
         let Some(active_popup) = self.active_popup.as_mut() else {
@@ -759,6 +773,9 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
               }
               Ok(ToUiMessage::CloseSession(t)) => {
                 out.send(Message::PopupSessionClosed(t)).await.unwrap();
+              }
+              Ok(ToUiMessage::RequestClosed(t)) => {
+                out.send(Message::PopupRequestClosed(t)).await.unwrap();
               }
               Err(e) => {
                 tracing::info!("channel from backend closed: {}", e);

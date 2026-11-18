@@ -24,7 +24,9 @@ pub enum ToBackendMessage {
 
 pub enum ToUiMessage {
   NewPopup(PopupData),
+  // TODO: rename to `SessionClosed`
   CloseSession(HandleToken),
+  RequestClosed(HandleToken),
 }
 
 #[derive(Clone)]
