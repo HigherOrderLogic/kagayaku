@@ -780,8 +780,7 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
           icons_cache: RwLock::new(HashMap::new()).into(),
         },
         Task::stream(stream::channel(10, async move |mut out| {
-          let mut stop = false;
-          while !stop {
+          loop {
             match ui_rx_clone.recv().await {
               Ok(ToUiMessage::NewPopup(d)) => {
                 out.send(Message::PopupReceived(Some(d))).await.unwrap();
@@ -794,8 +793,8 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
               }
               Err(e) => {
                 tracing::info!("channel from backend closed: {}", e);
-                stop = true;
                 out.send(Message::Exit).await.unwrap();
+                break;
               }
             }
           }
