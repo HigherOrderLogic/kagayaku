@@ -5,6 +5,7 @@
   libxkbcommon,
   libGL,
   wayland,
+  makeBinaryWrapper,
 }:
 rustPlatform.buildRustPackage (finalAttrs: let
   cargoToml = lib.importTOML "${finalAttrs.src}/Cargo.toml";
@@ -30,14 +31,11 @@ in {
 
   dontCargoInstall = true;
 
-  buildInputs = [libxkbcommon libGL wayland];
+  nativeBuildInputs = [makeBinaryWrapper];
 
-  env.RUSTFLAGS = lib.concatMapStringsSep " " (s: "-C link-arg=${s}") [
-    "-Wl,-rpath,${lib.makeLibraryPath [libxkbcommon libGL wayland]},--no-as-needed"
-    "-lwayland-client"
-    "-lxkbcommon"
-    "-lGL"
-  ];
+  postInstall = ''
+    wrapProgram $out/libexec/kagayaku --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [wayland libxkbcommon libGL]}
+  '';
 
   makeFlags = [
     "prefix=${placeholder "out"}"
