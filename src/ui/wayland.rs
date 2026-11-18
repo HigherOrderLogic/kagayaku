@@ -2,24 +2,24 @@ use std::collections::HashMap;
 
 use anyhow::Result as AnyResult;
 use iced::window;
-use sctk::reexports::{
-  calloop::{
-    EventLoop,
-    channel::{Channel, Event as ChannelEvent},
-  },
-  calloop_wayland_source::WaylandSource,
-  client::{
-    Connection, Dispatch, QueueHandle,
-    globals::{GlobalListContents, registry_queue_init},
-    protocol::{
-      wl_registry::{self, WlRegistry},
-      wl_surface::WlSurface,
+use sctk::{
+  delegate_registry,
+  reexports::{
+    calloop::{
+      EventLoop,
+      channel::{Channel, Event as ChannelEvent},
+    },
+    calloop_wayland_source::WaylandSource,
+    client::{
+      Connection, Dispatch, QueueHandle, delegate_noop, globals::registry_queue_init, protocol::wl_surface::WlSurface,
+    },
+    protocols::xdg::foreign::zv2::client::{
+      zxdg_imported_v2::{self, ZxdgImportedV2},
+      zxdg_importer_v2::ZxdgImporterV2,
     },
   },
-  protocols::xdg::foreign::zv2::client::{
-    zxdg_imported_v2::{self, ZxdgImportedV2},
-    zxdg_importer_v2::{self, ZxdgImporterV2},
-  },
+  registry::{ProvidesRegistryState, RegistryState},
+  registry_handlers,
 };
 use smol::channel::Sender as SmolSender;
 
@@ -37,28 +37,12 @@ struct WaylandState {
   imported: HashMap<window::Id, ZxdgImportedV2>,
 }
 
-impl Dispatch<WlRegistry, GlobalListContents> for WaylandState {
-  fn event(
-    _: &mut WaylandState,
-    _: &WlRegistry,
-    _: wl_registry::Event,
-    _: &GlobalListContents,
-    _: &Connection,
-    _: &QueueHandle<WaylandState>,
-  ) {
+impl ProvidesRegistryState for WaylandState {
+  fn registry(&mut self) -> &mut RegistryState {
+    &mut self.registry
   }
-}
 
-impl Dispatch<ZxdgImporterV2, ()> for WaylandState {
-  fn event(
-    _: &mut Self,
-    _: &ZxdgImporterV2,
-    _: zxdg_importer_v2::Event,
-    _: &(),
-    _: &Connection,
-    _: &QueueHandle<Self>,
-  ) {
-  }
+  registry_handlers!();
 }
 
 impl Dispatch<ZxdgImportedV2, window::Id> for WaylandState {
@@ -92,6 +76,7 @@ pub fn run_wayland_loop(
   let signal = event_loop.get_signal();
   let importer = globals.bind(&qh, 1..=1, ()).ok();
   let mut state = WaylandState {
+    registry: RegistryState::new(&globals),
     to_ui,
     qh,
     importer,
@@ -125,3 +110,6 @@ pub fn run_wayland_loop(
 
   event_loop.run(None, &mut state, |_| {}).map_err(|e| e.into())
 }
+
+delegate_registry!(WaylandState);
+delegate_noop!(WaylandState: ignore ZxdgImporterV2);

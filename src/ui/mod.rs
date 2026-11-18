@@ -234,13 +234,13 @@ struct ActivePopup {
   windows: HashMap<u64, WindowChoice>,
   state: State,
   window_id: window::Id,
+  wayland_tx: Option<CalloopSender<ToWaylandMessage>>,
 }
 
 struct Daemon {
   active_popup: Option<ActivePopup>,
   queued_popups: VecDeque<PopupData>,
   icons_cache: Arc<RwLock<HashMap<String, Option<Icon>>>>,
-  wayland_tx: Option<CalloopSender<ToWaylandMessage>>,
 }
 
 impl Daemon {
@@ -303,6 +303,7 @@ impl Daemon {
       windows: windows.into_iter().map(|(k, v)| (k, v.into())).collect(),
       state: Default::default(),
       window_id,
+      wayland_tx: None,
     });
 
     Task::batch(tasks.chain(iter::once(open_task.then(move |id| {
@@ -331,16 +332,16 @@ impl Daemon {
   }
 
   fn close_active_with(&mut self, backend_message: ToBackendMessage) -> Task<Message> {
-    let Some(active_popup) = self.active_popup.take() else {
+    let Some(mut active_popup) = self.active_popup.take() else {
       tracing::warn!("there's no popup to close");
       return Task::none();
     };
 
-    self.wayland_tx = None;
-
     if let Err(e) = active_popup.backend_tx.try_send(backend_message) {
       tracing::warn!("failed to send message to backend: {}", e);
     }
+    active_popup.wayland_tx.take();
+
     let close_task = window::close(active_popup.window_id);
 
     if let Some(next_popup) = self.queued_popups.pop_front() {
@@ -500,11 +501,14 @@ impl Daemon {
         Task::none()
       }
       Message::WaylandReady(conn, surface, parent, wid) => {
-        if self.active_popup.as_ref().is_some_and(|p| p.window_id == wid) && self.wayland_tx.is_none() {
+        if let Some(p) = self.active_popup.as_mut()
+          && p.window_id == wid
+          && p.wayland_tx.is_none()
+        {
           let (tx, channel) = calloop_channel();
           let (to_ui, to_ui_rx) = unbounded();
 
-          self.wayland_tx = Some(tx.clone());
+          p.wayland_tx = tx.clone().into();
 
           if let Some(p) = parent
             && let Err(e) = tx.send(ToWaylandMessage::SetParent(surface, p, wid))
@@ -774,7 +778,6 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
           active_popup: None,
           queued_popups: VecDeque::new(),
           icons_cache: RwLock::new(HashMap::new()).into(),
-          wayland_tx: None,
         },
         Task::stream(stream::channel(10, async move |mut out| {
           let mut stop = false;
