@@ -430,18 +430,26 @@ impl ScreencastImpl for ScreencastBackend {
   ) -> Result<Streams, PortalError> {
     tracing::info!("starting screencast session");
 
-    let mut sessions = self.sessions.lock().await;
-    let Some(session) = sessions.get_mut(&session_token) else {
-      return Err(PortalError::InvalidArgument("unknown session token".into()));
+    let (source_type, cursor_mode, multiple, persist_mode, stored_restore_data) = {
+      let mut sessions = self.sessions.lock().await;
+      let Some(session) = sessions.get_mut(&session_token) else {
+        return Err(PortalError::InvalidArgument("unknown session token".into()));
+      };
+      session.request_token = Some(token);
+      (
+        session.source_type,
+        session.cursor_mode,
+        session.multiple,
+        session.persist_mode,
+        session.restore_data.clone(),
+      )
     };
-    session.request_token = Some(token);
 
     let session_path = self.mutter_screencast_proxy.create_session(HashMap::new()).await?;
     let mut gnome_session = GnomeSession::new(&self.connection, session_path).await?;
 
-    let source_type = session.source_type;
-    let restored_streams = if session.persist_mode != PersistMode::DoNot
-      && let Some(d) = session.restore_data.as_ref()
+    let restored_streams = if persist_mode != PersistMode::DoNot
+      && let Some(d) = stored_restore_data.as_ref()
     {
       if let Ok((_, _, a)) = d.downcast_ref::<(i64, i64, Array)>() {
         self.restore_streams(a.iter(), source_type).await
@@ -452,11 +460,6 @@ impl ScreencastImpl for ScreencastBackend {
     } else {
       None
     };
-    let multiple = session.multiple;
-    let persist_mode = session.persist_mode;
-
-    // drop while running the UI
-    drop(sessions);
 
     let (remember, prompted_streams) = if restored_streams.is_none() {
       let (tx, rx) = unbounded();
@@ -542,15 +545,12 @@ impl ScreencastImpl for ScreencastBackend {
       (false, Vec::new())
     };
 
-    let mut sessions = self.sessions.lock().await;
-    let session = sessions.get_mut(&session_token).unwrap();
     let streams_iter = if let Some(s) = restored_streams.as_ref() {
       s.iter()
     } else {
       prompted_streams.iter()
     };
-    let should_return_restore_data =
-      session.persist_mode != PersistMode::DoNot && (restored_streams.is_some() || remember);
+    let should_return_restore_data = persist_mode != PersistMode::DoNot && (restored_streams.is_some() || remember);
 
     for stream in streams_iter {
       match stream {
@@ -559,14 +559,14 @@ impl ScreencastImpl for ScreencastBackend {
           connector,
           match_string,
         } => {
-          if session.source_type.contains(SourceType::MONITOR) {
+          if source_type.contains(SourceType::MONITOR) {
             gnome_session
               .record_monitor(
                 &self.connection,
                 *id,
                 connector.to_string(),
                 match_string.to_string(),
-                session.cursor_mode,
+                cursor_mode,
               )
               .await?;
           }
@@ -577,7 +577,7 @@ impl ScreencastImpl for ScreencastBackend {
           app_id,
           title,
         } => {
-          if session.source_type.contains(SourceType::WINDOW) {
+          if source_type.contains(SourceType::WINDOW) {
             gnome_session
               .record_window(
                 &self.connection,
@@ -585,7 +585,7 @@ impl ScreencastImpl for ScreencastBackend {
                 *window_id,
                 app_id.to_string(),
                 title.to_string(),
-                session.cursor_mode,
+                cursor_mode,
               )
               .await?;
           }
@@ -600,8 +600,7 @@ impl ScreencastImpl for ScreencastBackend {
     let last_used_time = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .map_or(0, |d| d.as_micros().try_into().unwrap_or(i64::MAX));
-    let creation_time = session
-      .restore_data
+    let creation_time = stored_restore_data
       .as_ref()
       .and_then(|d| d.downcast_ref::<(i64, i64, Array)>().ok())
       .map_or(last_used_time, |(t, _, _)| t);
@@ -634,7 +633,7 @@ impl ScreencastImpl for ScreencastBackend {
     let mut resp = StreamsBuilder::new(streams);
 
     if should_return_restore_data {
-      resp = resp.persist_mode(Some(session.persist_mode)).restore_data(Some((
+      resp = resp.persist_mode(Some(persist_mode)).restore_data(Some((
         RESTORE_DATA_PROVIDER.to_string(),
         RESTORE_DATA_VERSION,
         Variant::from((creation_time, last_used_time, restore_data))
@@ -643,7 +642,12 @@ impl ScreencastImpl for ScreencastBackend {
       )));
     }
 
-    session.gnome_session = Some(gnome_session);
+    let mut sessions = self.sessions.lock().await;
+    if let Some(s) = sessions.get_mut(&session_token) {
+      s.gnome_session = Some(gnome_session)
+    } else {
+      gnome_session.stop().await?
+    }
 
     Ok(resp.build())
   }
