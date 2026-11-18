@@ -260,7 +260,7 @@ impl Daemon {
         application_id: APP_ID.into(),
         ..Default::default()
       },
-      size: Size::new(360.0, 660.0),
+      size: Size::new(640., 540.),
       position: window::Position::Centered,
       level: Level::AlwaysOnTop,
       exit_on_close_request: false,
