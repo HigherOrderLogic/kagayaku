@@ -52,7 +52,7 @@ use crate::{
     },
     window_tracker::WindowStateTracker,
   },
-  common::{PopupData, ScreencastStreamChoice, ToBackendMessage, ToUiMessage},
+  common::{PopupData, PopupType, ScreencastData, ScreencastStreamChoice, ToBackendMessage, ToUiMessage},
 };
 
 mod generated {
@@ -479,20 +479,24 @@ impl ScreencastImpl for ScreencastBackend {
 
       let popup_data = PopupData {
         session_token: session_token.clone(),
-        app_id: client_app_id.map(|i| i.to_string()),
-        parent_window: window_identifier.and_then(|ty| {
-          if let WindowIdentifierType::Wayland(id) = ty {
-            Some(id)
-          } else {
-            None
-          }
-        }),
-        backend_tx: tx,
-        multiple,
-        source_type,
-        persist_mode,
-        monitors,
-        windows,
+        popup_type: PopupType::Screencast(
+          ScreencastData {
+            app_id: client_app_id.map(|i| i.to_string()),
+            backend_tx: tx,
+            multiple,
+            source_type,
+            persist_mode,
+            monitors,
+            windows,
+          },
+          window_identifier.and_then(|ty| {
+            if let WindowIdentifierType::Wayland(id) = ty {
+              Some(id)
+            } else {
+              None
+            }
+          }),
+        ),
       };
 
       if let Err(e) = self.ui_tx.send(ToUiMessage::NewPopup(popup_data)).await {
