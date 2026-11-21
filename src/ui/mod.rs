@@ -7,6 +7,7 @@ use std::{
   path::{Path, PathBuf},
   process::Command,
   sync::{Arc, LazyLock},
+  thread::Builder as ThreadBuilder,
 };
 
 use ashpd::desktop::{HandleToken, PersistMode, screencast::SourceType};
@@ -41,16 +42,15 @@ use iced::{
 };
 use iced_palace::widget::ellipsized_text;
 use sctk::reexports::{
+  calloop::channel::{Sender as CalloopSender, channel as calloop_channel},
   client::{
     Connection, Proxy,
     backend::{Backend, ObjectId},
-    globals::registry_queue_init,
     protocol::wl_surface::WlSurface,
   },
-  protocols::xdg::foreign::zv2::client::zxdg_importer_v2::ZxdgImporterV2,
 };
 use smol::{
-  channel::{Receiver, Sender},
+  channel::{Receiver, Sender, unbounded},
   fs::{OpenOptions, metadata},
   lock::RwLock,
   unblock,
@@ -60,7 +60,7 @@ use tracing::instrument;
 use crate::{
   backend::{display_tracker::Monitor, window_tracker::Window},
   common::{PopupData, ScreencastStreamChoice, ToBackendMessage, ToUiMessage},
-  ui::wayland::WaylandState,
+  ui::wayland::{ToWaylandMessage, run_wayland_loop},
 };
 
 const APP_ID: &str = "com.hol.kagayaku";
@@ -162,6 +162,11 @@ enum ChoiceType {
 }
 
 #[derive(Clone)]
+enum WaylandMessage {
+  ParentDestroyed(window::Id),
+}
+
+#[derive(Clone)]
 enum Message {
   PopupReceived(Option<PopupData>),
   PopupCloseRequested(window::Id),
@@ -173,7 +178,8 @@ enum Message {
   Cancel,
   Share,
   SetAppIcon(u64, Option<Icon>),
-  WaylandReady(Connection, WlSurface, String),
+  WaylandReady(Connection, WlSurface, Option<String>, window::Id),
+  Wayland(WaylandMessage),
   Exit,
   None,
 }
@@ -228,7 +234,7 @@ struct ActivePopup {
   windows: HashMap<u64, WindowChoice>,
   state: State,
   window_id: window::Id,
-  parent_set: bool,
+  wayland_tx: Option<CalloopSender<ToWaylandMessage>>,
 }
 
 struct Daemon {
@@ -297,40 +303,36 @@ impl Daemon {
       windows: windows.into_iter().map(|(k, v)| (k, v.into())).collect(),
       state: Default::default(),
       window_id,
-      parent_set: false,
+      wayland_tx: None,
     });
 
     Task::batch(tasks.chain(iter::once(open_task.then(move |id| {
-      if let Some(parent) = parent_window.clone() {
-        window::run(id, |w| {
-          let Ok(RawWindowHandle::Wayland(window_handle)) = w.window_handle().map(|h| h.as_raw()) else {
-            return Message::None;
-          };
-          let Ok(RawDisplayHandle::Wayland(display_handle)) = w.display_handle().map(|h| h.as_raw()) else {
-            return Message::None;
-          };
-          let backend = unsafe { Backend::from_foreign_display(display_handle.display.as_ptr().cast()) };
-          let conn = Connection::from_backend(backend);
-          let surface_id =
-            match unsafe { ObjectId::from_ptr(WlSurface::interface(), window_handle.surface.as_ptr().cast()) } {
-              Ok(sid) => sid,
-              Err(_) => return Message::None,
-            };
-          let Ok(surface) = WlSurface::from_id(&conn, surface_id) else {
-            tracing::warn!("invalid wl_surface id");
-            return Message::None;
-          };
-          Message::WaylandReady(conn, surface, parent)
-        })
-      } else {
-        tracing::info!("no parent window to associate");
-        Task::none()
-      }
+      let parent_clone = parent_window.clone();
+      window::run(id, move |w| {
+        let Ok(RawWindowHandle::Wayland(window_handle)) = w.window_handle().map(|h| h.as_raw()) else {
+          return Message::None;
+        };
+        let Ok(RawDisplayHandle::Wayland(display_handle)) = w.display_handle().map(|h| h.as_raw()) else {
+          return Message::None;
+        };
+        let backend = unsafe { Backend::from_foreign_display(display_handle.display.as_ptr().cast()) };
+        let conn = Connection::from_backend(backend);
+        let Ok(surface_id) =
+          (unsafe { ObjectId::from_ptr(WlSurface::interface(), window_handle.surface.as_ptr().cast()) })
+        else {
+          return Message::None;
+        };
+        let Ok(surface) = WlSurface::from_id(&conn, surface_id) else {
+          tracing::warn!("invalid wl_surface id");
+          return Message::None;
+        };
+        Message::WaylandReady(conn, surface, parent_clone, id)
+      })
     }))))
   }
 
   fn close_active_with(&mut self, backend_message: ToBackendMessage) -> Task<Message> {
-    let Some(active_popup) = self.active_popup.take() else {
+    let Some(mut active_popup) = self.active_popup.take() else {
       tracing::warn!("there's no popup to close");
       return Task::none();
     };
@@ -338,6 +340,8 @@ impl Daemon {
     if let Err(e) = active_popup.backend_tx.try_send(backend_message) {
       tracing::warn!("failed to send message to backend: {}", e);
     }
+    active_popup.wayland_tx.take();
+
     let close_task = window::close(active_popup.window_id);
 
     if let Some(next_popup) = self.queued_popups.pop_front() {
@@ -374,24 +378,17 @@ impl Daemon {
         self.close_active_with(ToBackendMessage::Cancel)
       }
       Message::PopupSessionClosed(session_token) => {
-        if let Some(active_popup) = self.active_popup.as_ref()
-          && active_popup.session_token == session_token
+        if self
+          .active_popup
+          .as_ref()
+          .is_some_and(|p| p.session_token == session_token)
         {
-          if active_popup.parent_set {
-            tracing::info!(
-              "popup for session {} is associated with a parent, ignoring",
-              session_token
-            );
-            return Task::none();
-          } else {
-            tracing::info!("popup cancelled by backend for session {}", session_token);
-            return self.close_active_with(ToBackendMessage::Cancel);
-          }
+          tracing::info!("popup cancelled by backend for session {}", session_token);
+          self.close_active_with(ToBackendMessage::Cancel)
         } else {
           self.queued_popups.retain(|p| p.session_token != session_token);
+          Task::none()
         }
-
-        Task::none()
       }
       Message::PopupRequestClosed(session_token) => {
         if self
@@ -503,24 +500,42 @@ impl Daemon {
 
         Task::none()
       }
-      Message::WaylandReady(conn, surface, parent) => {
-        let Ok((globals, event_queue)) = registry_queue_init::<WaylandState>(&conn) else {
-          tracing::warn!("failed to init registry queue");
-          return Task::none();
-        };
-        let qh = event_queue.handle();
-        if let Ok(importer) = globals.bind::<ZxdgImporterV2, _, _>(&qh, 1..=1, ()) {
-          importer.import_toplevel(parent, &qh, ()).set_parent_of(&surface);
-          if let Err(e) = event_queue.flush() {
-            tracing::warn!("failed to send Wayland request to compositor: {}", e);
-          } else if let Some(popup) = self.active_popup.as_mut() {
-            popup.parent_set = true;
-          }
-        } else {
-          tracing::warn!("failed to bind {}", ZxdgImporterV2::interface().name);
-        }
+      Message::WaylandReady(conn, surface, parent, wid) => {
+        if let Some(p) = self.active_popup.as_mut()
+          && p.window_id == wid
+          && p.wayland_tx.is_none()
+        {
+          let (tx, channel) = calloop_channel();
+          let (to_ui, to_ui_rx) = unbounded();
 
-        Task::none()
+          p.wayland_tx = tx.clone().into();
+
+          if let Some(p) = parent
+            && let Err(e) = tx.send(ToWaylandMessage::SetParent(surface, p, wid))
+          {
+            tracing::warn!("failed to send message to wayland thread: {}", e)
+          };
+
+          ThreadBuilder::new()
+            .spawn(|| {
+              if let Err(e) = run_wayland_loop(conn, channel, to_ui) {
+                tracing::error!("wayland event loop stopped: {}", e);
+              }
+            })
+            .expect("failed to spawn wayland thread");
+
+          Task::stream(to_ui_rx).map(Message::Wayland)
+        } else {
+          Task::none()
+        }
+      }
+      Message::Wayland(WaylandMessage::ParentDestroyed(wid)) => {
+        if self.active_popup.as_ref().is_some_and(|p| p.window_id == wid) {
+          tracing::info!("parent window for popup {} closed, cancelling", wid);
+          self.close_active_with(ToBackendMessage::Cancel)
+        } else {
+          Task::none()
+        }
       }
       Message::Exit => {
         if let Some(active_popup) = self.active_popup.take() {
@@ -765,8 +780,7 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
           icons_cache: RwLock::new(HashMap::new()).into(),
         },
         Task::stream(stream::channel(10, async move |mut out| {
-          let mut stop = false;
-          while !stop {
+          loop {
             match ui_rx_clone.recv().await {
               Ok(ToUiMessage::NewPopup(d)) => {
                 out.send(Message::PopupReceived(Some(d))).await.unwrap();
@@ -779,8 +793,8 @@ pub fn ui_main(ui_rx: Receiver<ToUiMessage>) -> iced::Result {
               }
               Err(e) => {
                 tracing::info!("channel from backend closed: {}", e);
-                stop = true;
                 out.send(Message::Exit).await.unwrap();
+                break;
               }
             }
           }
