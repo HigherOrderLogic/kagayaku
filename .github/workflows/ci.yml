@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  DEPS_UBUNTU: libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v32
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ github.workflow }}-${{ github.job }}-${{ github.run_id }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-${{ github.workflow }}-${{ github.job }}-
+          gc-max-store-size: 2G
+
+      - name: Check formatting
+        run: |
+          nix fmt
+          git diff --exit-code
+
+  clippy:
+    needs:
+      - fmt
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $DEPS_UBUNTU
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --all --all-targets --locked -- -D warnings
+
+  build:
+    needs:
+      - fmt
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-26.04-arm
+        toolchain:
+          - stable
+          - stable minus 10 releases
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $DEPS_UBUNTU
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --all --all-targets --locked
