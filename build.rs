@@ -51,6 +51,8 @@ fn main() -> Result<(), AnyError> {
   xml_dir.push("dbus");
 
   let mut interfaces_impl = Vec::new();
+  // TODO: remove next `zbus` bump
+  let clippy_allow_re = Regex::new(r"(?m)^\s*#\[allow\(clippy::type_complexity\)\](\n|$)")?;
 
   for entry in read_dir(xml_dir)? {
     let path = match entry {
@@ -78,7 +80,12 @@ fn main() -> Result<(), AnyError> {
           "build.rs",
         )?,
       );
-      interfaces_impl.push(format!("pub mod {} {{ {} }}", mod_name, iface_impl));
+
+      interfaces_impl.push(format!(
+        "#[allow(clippy::type_complexity)]\npub mod {} {{ {} }}",
+        mod_name,
+        clippy_allow_re.replace_all(iface_impl.as_str(), "")
+      ));
     }
   }
 
