@@ -5,6 +5,7 @@ use smol::channel::Sender;
 
 use crate::backend::{display_tracker::Monitor, window_tracker::Window};
 
+#[derive(Clone)]
 pub enum ScreencastStreamChoice {
   Monitor {
     connector: String,
@@ -17,6 +18,7 @@ pub enum ScreencastStreamChoice {
   },
 }
 
+#[derive(Clone)]
 pub enum ToBackendMessage {
   Success((bool, Vec<ScreencastStreamChoice>)),
   Cancel,
@@ -29,11 +31,17 @@ pub enum ToUiMessage {
   RequestClosed(HandleToken),
 }
 
-#[derive(Clone)]
 pub struct PopupData {
   pub session_token: HandleToken,
+  pub popup_type: PopupType,
+}
+
+pub enum PopupType {
+  Screencast(ScreencastData, Option<String>),
+}
+
+pub struct ScreencastData {
   pub app_id: Option<String>,
-  pub parent_window: Option<String>,
   pub backend_tx: Sender<ToBackendMessage>,
   pub multiple: bool,
   pub source_type: SourceType,
